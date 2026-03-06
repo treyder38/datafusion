@@ -15,7 +15,8 @@ def check_gpu():
         model = CatBoostClassifier(task_type="GPU", iterations=1, verbose=0)
         model.fit([[0, 1], [1, 0]], [0, 1])
         return True
-    except Exception:
+    except Exception as e:
+        print(f"GPU недоступен: {e}")
         return False
 
 
