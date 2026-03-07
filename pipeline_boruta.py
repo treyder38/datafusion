@@ -100,7 +100,7 @@ def run_boruta(X, y, feature_subset, cat_cols_set, task_type, n_trials=50):
 
     selector = BorutaShap(
         model=boruta_model,
-        importance_measure="shap",
+        importance_measure="gini",
         classification=True,
     )
 
@@ -237,11 +237,7 @@ def main():
 
     print(f"X_train: {X_train.shape}, X_test: {X_test.shape}, Y_train: {Y_train.shape}")
 
-    # ── 5. Быстрая оценка важности признаков ────────────────────────────────
-
-    target_means = Y_train.mean(axis=0)
-    balanced_idx = np.argsort(np.abs(target_means - 0.5))[:3]
-    print(f"Таргеты для оценки важности: {[target_cols[i] for i in balanced_idx]}")
+    # ── 5. Быстрая оценка важности признаков (все таргеты) ──────────────────
 
     quick_params = dict(
         iterations=200, learning_rate=0.1, depth=6, l2_leaf_reg=3,
@@ -250,56 +246,70 @@ def main():
     )
 
     importances = np.zeros(len(all_feature_cols))
-    for ti in balanced_idx:
+    n_valid = 0
+    print(f"Оценка важности на всех {len(target_cols)} таргетах:")
+    for ti in range(len(target_cols)):
         y = Y_train[:, ti]
+        if y.sum() < N_FOLDS:
+            print(f"  {target_cols[ti]}: SKIP (n_pos={int(y.sum())})")
+            continue
         model = CatBoostClassifier(**quick_params)
         model.fit(X_train, y, cat_features=cat_indices)
         importances += model.get_feature_importance()
         auc = roc_auc_score(y, model.predict_proba(X_train)[:, 1])
+        n_valid += 1
         print(f"  {target_cols[ti]}: train AUC = {auc:.4f}")
 
-    importances /= len(balanced_idx)
+    importances /= n_valid
 
     feat_imp = sorted(zip(all_feature_cols, importances), key=lambda x: -x[1])
-    selected_features = [name for name, imp in feat_imp if imp > 0]
-    print(f"Признаков с importance > 0: {len(selected_features)}")
+    nonzero_features = [name for name, imp in feat_imp if imp > 0]
+    selected_features = nonzero_features[:100]
+    print(f"Признаков с importance > 0: {len(nonzero_features)}")
     print(f"Убрано с нулевой важностью: {len([1 for _, imp in feat_imp if imp == 0])}")
+    print(f"Берём топ-100 для дальнейшего обучения")
 
-    # ── 6. Boruta отбор ──────────────────────────────────────────────────────
-    # Запускаем Boruta на самом сбалансированном таргете.
-    # На больших данных Boruta долгий, поэтому используем subsample 50k строк.
+    # ── 6. Boruta отбор на всех таргетах → union ─────────────────────────────
 
     print(f"\n{'=' * 60}")
-    print("Boruta feature selection")
+    print("Boruta feature selection (все таргеты)")
     print(f"{'=' * 60}")
 
-    boruta_target_idx = balanced_idx[0]
-    y_boruta = Y_train[:, boruta_target_idx]
-
-    # subsample для ускорения
     BORUTA_SAMPLE = 50_000
+    rng = np.random.default_rng(SEED)
+
     if len(X_train) > BORUTA_SAMPLE:
-        rng = np.random.default_rng(SEED)
         sample_idx = rng.choice(len(X_train), size=BORUTA_SAMPLE, replace=False)
-        X_boruta = X_train[all_feature_cols].iloc[sample_idx].reset_index(drop=True)
-        y_boruta_sample = y_boruta[sample_idx]
+        X_boruta_base = X_train[selected_features].iloc[sample_idx].reset_index(drop=True)
+        Y_boruta = Y_train[sample_idx]
     else:
-        X_boruta = X_train[all_feature_cols].reset_index(drop=True)
-        y_boruta_sample = y_boruta
+        X_boruta_base = X_train[selected_features].reset_index(drop=True)
+        Y_boruta = Y_train
 
-    print(f"Boruta на таргете '{target_cols[boruta_target_idx]}', "
-          f"subsample={len(X_boruta)}, признаков={len(all_feature_cols)}")
+    union_features = set()
 
-    best_features = run_boruta(
-        X=X_boruta,
-        y=y_boruta_sample,
-        feature_subset=all_feature_cols,
-        cat_cols_set=set(all_cat_cols),
-        task_type=task_type,
-        n_trials=50,
-    )
+    for ti in range(len(target_cols)):
+        y = Y_boruta[:, ti]
+        if y.sum() < N_FOLDS:
+            print(f"  [{ti+1}/{len(target_cols)}] {target_cols[ti]}: SKIP (n_pos={int(y.sum())})")
+            continue
 
-    print(f"После Boruta: {len(best_features)} признаков")
+        print(f"\n  [{ti+1}/{len(target_cols)}] {target_cols[ti]}")
+        confirmed = run_boruta(
+            X=X_boruta_base,
+            y=y,
+            feature_subset=selected_features,
+            cat_cols_set=set(all_cat_cols),
+            task_type=task_type,
+            n_trials=30,
+        )
+        union_features.update(confirmed)
+        print(f"  Накоплено в union: {len(union_features)}")
+
+    # сохраняем порядок по importance
+    best_features = [f for f in selected_features if f in union_features]
+
+    print(f"\nПосле Boruta union: {len(best_features)} признаков")
     save_feature_list(best_features, "selected_features_final.txt")
 
     # ── 7. Финальная модель ──────────────────────────────────────────────────
