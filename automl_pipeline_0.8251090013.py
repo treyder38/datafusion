@@ -291,7 +291,7 @@ def main():
             fold_aucs = []
             ti_test_pred = np.zeros(len(X_test))
 
-            for fold, (tr_idx, val_idx) in enumerate(skf.split(X_train[best_features], y)):
+            for _, (tr_idx, val_idx) in enumerate(skf.split(X_train[best_features], y)):
                 X_tr = X_train[best_features].iloc[tr_idx]
                 X_val = X_train[best_features].iloc[val_idx]
                 y_tr, y_val = y[tr_idx], y[val_idx]
