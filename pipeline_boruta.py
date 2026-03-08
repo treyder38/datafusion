@@ -100,7 +100,7 @@ def run_boruta(X, y, feature_subset, cat_cols_set, task_type, n_trials=50):
 
     selector = BorutaShap(
         model=boruta_model,
-        importance_measure="gini",
+        importance_measure="shap",
         classification=True,
     )
 
@@ -263,19 +263,21 @@ def main():
     importances /= n_valid
 
     feat_imp = sorted(zip(all_feature_cols, importances), key=lambda x: -x[1])
-    nonzero_features = [name for name, imp in feat_imp if imp > 0]
-    selected_features = nonzero_features[:100]
-    print(f"Признаков с importance > 0: {len(nonzero_features)}")
+    selected_features = [name for name, imp in feat_imp if imp > 0]
+    print(f"Признаков с importance > 0: {len(selected_features)}")
     print(f"Убрано с нулевой важностью: {len([1 for _, imp in feat_imp if imp == 0])}")
-    print(f"Берём топ-100 для дальнейшего обучения")
 
-    # ── 6. Boruta отбор на всех таргетах → union ─────────────────────────────
+    # ── 6+7. Per-target: Boruta → индивидуальная модель ─────────────────────
+    # Для каждого таргета:
+    #   1. Boruta отбирает признаки именно для этого таргета
+    #   2. На этих признаках обучается своя модель (5-fold CV)
+    #   3. Предсказания собираются в итоговую матрицу
 
     print(f"\n{'=' * 60}")
-    print("Boruta feature selection (все таргеты)")
+    print("Per-target Boruta + обучение")
     print(f"{'=' * 60}")
 
-    BORUTA_SAMPLE = 50_000
+    BORUTA_SAMPLE = 350_000
     rng = np.random.default_rng(SEED)
 
     if len(X_train) > BORUTA_SAMPLE:
@@ -286,34 +288,6 @@ def main():
         X_boruta_base = X_train[selected_features].reset_index(drop=True)
         Y_boruta = Y_train
 
-    union_features = set()
-
-    for ti in range(len(target_cols)):
-        y = Y_boruta[:, ti]
-        if y.sum() < N_FOLDS:
-            print(f"  [{ti+1}/{len(target_cols)}] {target_cols[ti]}: SKIP (n_pos={int(y.sum())})")
-            continue
-
-        print(f"\n  [{ti+1}/{len(target_cols)}] {target_cols[ti]}")
-        confirmed = run_boruta(
-            X=X_boruta_base,
-            y=y,
-            feature_subset=selected_features,
-            cat_cols_set=set(all_cat_cols),
-            task_type=task_type,
-            n_trials=30,
-        )
-        union_features.update(confirmed)
-        print(f"  Накоплено в union: {len(union_features)}")
-
-    # сохраняем порядок по importance
-    best_features = [f for f in selected_features if f in union_features]
-
-    print(f"\nПосле Boruta union: {len(best_features)} признаков")
-    save_feature_list(best_features, "selected_features_final.txt")
-
-    # ── 7. Финальная модель ──────────────────────────────────────────────────
-
     final_params = dict(
         iterations=3000, learning_rate=0.02, depth=8, l2_leaf_reg=1,
         random_strength=0.5, bagging_temperature=0.8,
@@ -321,65 +295,80 @@ def main():
         loss_function="Logloss", eval_metric="AUC", auto_class_weights="Balanced",
     )
 
-    print(f"=== Финальная модель: {len(best_features)} признаков, {N_FOLDS} фолдов ===")
-    oof_final, test_final, aucs_final, macro_final = train_and_evaluate(
-        X_train, Y_train, X_test, best_features, target_cols, set(all_cat_cols),
-        task_type, n_folds=N_FOLDS, params=final_params, early_stopping=100,
-    )
+    test_final = np.zeros((len(X_test), len(target_cols)))
+    aucs_final = []
+    target_features_map = {}  # какие признаки у какого таргета
 
-    # ── 8. Per-target тюнинг для слабых таргетов ─────────────────────────────
+    for ti in range(len(target_cols)):
+        y_full = Y_train[:, ti]
+        y_boruta = Y_boruta[:, ti]
 
-    weak_targets_idx = [i for i, a in enumerate(aucs_final) if a < 0.6]
-    print(f"Слабых таргетов (AUC < 0.6): {len(weak_targets_idx)}")
+        print(f"\n{'=' * 60}")
+        print(f"[{ti+1}/{len(target_cols)}] {target_cols[ti]}")
+        print(f"{'=' * 60}")
 
-    if weak_targets_idx:
-        print("Пробуем агрессивные параметры для слабых таргетов...\n")
-        aggressive_params = dict(
-            iterations=5000, learning_rate=0.01, depth=10, l2_leaf_reg=0.5,
-            random_strength=1.0, bagging_temperature=1.0,
-            task_type=task_type, random_seed=SEED, verbose=0,
-            loss_function="Logloss", eval_metric="AUC", auto_class_weights="Balanced",
+        if y_full.sum() < N_FOLDS:
+            print(f"SKIP (n_pos={int(y_full.sum())})")
+            test_final[:, ti] = y_full.mean()
+            aucs_final.append(0.5)
+            target_features_map[target_cols[ti]] = []
+            continue
+
+        # Boruta для этого таргета
+        ti_features = run_boruta(
+            X=X_boruta_base,
+            y=y_boruta,
+            feature_subset=selected_features,
+            cat_cols_set=set(all_cat_cols),
+            task_type=task_type,
+            n_trials=30,
         )
-        subset_cat_idx = [i for i, c in enumerate(best_features) if c in all_cat_cols]
 
-        for ti in weak_targets_idx:
-            y = Y_train[:, ti]
-            if y.sum() < N_FOLDS:
-                continue
+        # fallback если Boruta ничего не нашёл
+        if not ti_features:
+            ti_features = selected_features[:20]
+            print(f"  Boruta не нашёл признаков, fallback к топ-20 по importance")
 
-            skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
-            fold_aucs = []
-            ti_test_pred = np.zeros(len(X_test))
+        target_features_map[target_cols[ti]] = ti_features
+        print(f"  Признаков для таргета: {len(ti_features)}")
 
-            for _, (tr_idx, val_idx) in enumerate(skf.split(X_train[best_features], y)):
-                X_tr = X_train[best_features].iloc[tr_idx]
-                X_val = X_train[best_features].iloc[val_idx]
-                y_tr, y_val = y[tr_idx], y[val_idx]
+        # обучение модели на признаках этого таргета
+        ti_cat_idx = [i for i, c in enumerate(ti_features) if c in all_cat_cols]
+        X_sub = X_train[ti_features]
+        skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+        fold_aucs = []
 
-                m = CatBoostClassifier(**aggressive_params, early_stopping_rounds=150)
-                m.fit(X_tr, y_tr, eval_set=(X_val, y_val), cat_features=subset_cat_idx)
+        for _, (tr_idx, val_idx) in enumerate(skf.split(X_sub, y_full)):
+            X_tr, X_val = X_sub.iloc[tr_idx], X_sub.iloc[val_idx]
+            y_tr, y_val = y_full[tr_idx], y_full[val_idx]
 
-                val_pred = m.predict_proba(X_val)[:, 1]
-                fold_aucs.append(roc_auc_score(y_val, val_pred))
-                ti_test_pred += m.predict_proba(X_test[best_features])[:, 1] / N_FOLDS
+            m = CatBoostClassifier(**final_params, early_stopping_rounds=100)
+            m.fit(X_tr, y_tr, eval_set=(X_val, y_val), cat_features=ti_cat_idx)
 
-            new_auc = np.mean(fold_aucs)
-            old_auc = aucs_final[ti]
-            if new_auc > old_auc:
-                print(f"  {target_cols[ti]}: {old_auc:.4f} -> {new_auc:.4f} (IMPROVED)")
-                test_final[:, ti] = ti_test_pred
-                aucs_final[ti] = new_auc
-            else:
-                print(f"  {target_cols[ti]}: {old_auc:.4f} -> {new_auc:.4f} (keeping original)")
+            val_pred = m.predict_proba(X_val)[:, 1]
+            fold_aucs.append(roc_auc_score(y_val, val_pred))
+            test_final[:, ti] += m.predict_proba(X_test[ti_features])[:, 1] / N_FOLDS
 
-        print(f"\nОбновленный Macro AUC: {np.mean(aucs_final):.4f}")
+        mean_auc = np.mean(fold_aucs)
+        aucs_final.append(mean_auc)
+        print(f"  AUC={mean_auc:.4f} (+/- {np.std(fold_aucs):.4f})")
+
+    macro_final = np.mean(aucs_final)
+    print(f"\n>>> Macro AUC: {macro_final:.4f}")
+
+    # сохраняем признаки каждого таргета
+    features_out = Path("selected_features_per_target.txt")
+    lines = []
+    for tname, feats in target_features_map.items():
+        lines.append(f"{tname}: {','.join(feats)}")
+    features_out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Признаки по таргетам сохранены в: {features_out}")
 
     # ── 9. Сохранение submission ─────────────────────────────────────────────
 
     predict_cols = [c.replace("target_", "predict_") for c in target_cols]
     submit = test_ids.hstack(pl.DataFrame(test_final, schema=predict_cols))
     submit.write_parquet("submission_automl_boruta.parquet")
-    save_feature_list(best_features, "selected_features_final.txt")
 
     print(f"\nSubmission shape: {submit.shape}")
     print("Saved: submission_automl_boruta.parquet")
