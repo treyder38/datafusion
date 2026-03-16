@@ -1,5 +1,9 @@
+sample_submit.parquet
 test_extra_features.parquet
 test_main_features.parquet
 train_extra_features.parquet
 train_main_features.parquet
 train_target.parquet
+datafusion_opp_and_my_pipe/__pycache__
+datafusion_opp_and_my_pipe/catboost_info
+logs
