@@ -23,7 +23,7 @@ import polars as pl
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc, detect_lgbm_device, load_zero_importance_mask
+from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc, load_zero_importance_mask
 
 FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_lgbm")
@@ -51,10 +51,9 @@ LGBM_PARAMS = dict(
     subsample_freq=2,
     random_state=SEED,
     verbose=-1,
-    # ── Speed optimizations for 2260 features ──
+    # ── Speed optimizations ──
     force_col_wise=True,       # faster for #features >> #rows/1000
-    min_data_in_bin=50,        # fewer bin boundaries → faster histogram build (default=20)
-    max_bin=127,               # half the default (255) → 2x faster histogram, minimal AUC loss
+    max_bin=127,               # was 63 on GPU; 127 is better quality + still fast on CPU
 )
 EARLY_STOPPING_ROUNDS = 100
 
@@ -96,9 +95,9 @@ def main():
     print("Step 3: Train LightGBM (5-fold × 41 targets)")
     print("=" * 60)
 
-    device_params, device_name, supports_cat = detect_lgbm_device()
-    print(f"  LightGBM device_type: {device_name}")
-    print(f"  Parallelism: {PARALLEL_TARGETS} targets × {THREADS_PER_MODEL} threads")
+    # Force CPU: 224 cores with parallel targets is faster than sequential GPU
+    device_params, supports_cat = {}, True
+    print(f"  LightGBM: CPU mode, {PARALLEL_TARGETS} parallel targets × {THREADS_PER_MODEL} threads")
 
     # 1. Load features
     print("\n[1/4] Loading features...")
@@ -164,7 +163,7 @@ def main():
         y_tr, y_val = y_train[tr_idx], y_train[val_idx]
         fold_test_preds = np.zeros((n_test, n_targets))
 
-        # Build args for all targets
+        # Parallel training across targets on CPU
         task_args = []
         for i, col in enumerate(target_cols):
             task_args.append((
@@ -172,8 +171,6 @@ def main():
                 cat_indices, supports_cat, device_params,
                 col, fold_idx, THREADS_PER_MODEL,
             ))
-
-        # Parallel training across targets
         with ProcessPoolExecutor(max_workers=PARALLEL_TARGETS) as executor:
             futures = {executor.submit(_train_one_target, a): i
                        for i, a in enumerate(task_args)}

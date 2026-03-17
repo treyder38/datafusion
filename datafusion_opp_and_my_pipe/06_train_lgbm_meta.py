@@ -23,7 +23,7 @@ import polars as pl
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc, detect_lgbm_device, load_zero_importance_mask
+from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc, load_zero_importance_mask
 
 FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_lgbm_meta")
@@ -51,7 +51,6 @@ LGBM_PARAMS = dict(
     random_state=SEED,
     verbose=-1,
     force_col_wise=True,
-    min_data_in_bin=50,
     max_bin=127,
 )
 EARLY_STOPPING_ROUNDS = 100
@@ -115,8 +114,9 @@ def main():
     print(f"Step 6: LGBM with cross-target meta-features ({n_models} models)")
     print("=" * 60)
 
-    device_params, device_name, supports_cat = detect_lgbm_device()
-    print(f"  LightGBM device_type: {device_name}")
+    # Force CPU: parallel targets on 224 cores is faster than sequential GPU
+    device_params, supports_cat = {}, True
+    print(f"  LightGBM: CPU mode, {N_CPUS} threads")
 
     # 1. Load base features
     print("\n[1/4] Loading features...")
