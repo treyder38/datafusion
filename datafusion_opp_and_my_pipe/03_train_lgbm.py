@@ -1,10 +1,11 @@
 """Step 3: Train LightGBM (Optuna-tuned params, 5-fold).
 
 Loads features from features/, trains 41 per-target binary classifiers.
+Targets are trained in parallel batches for speed.
 
 Output: checkpoints_lgbm/lgbm_predictions.npz (oof_preds, test_preds)
 
-Runtime: ~20-30 minutes.
+Runtime: ~5-10 minutes.
 """
 
 import gc
@@ -13,6 +14,7 @@ import os
 import sys
 import time
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import lightgbm as lgb
@@ -21,11 +23,16 @@ import polars as pl
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, detect_lgbm_device
+from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc, detect_lgbm_device, load_zero_importance_mask
 
 FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_lgbm")
 MODELS_DIR = CHECKPOINT_DIR / "models"
+
+# How many targets to train in parallel (each gets N_CPUS // PARALLEL_TARGETS threads)
+N_CPUS = os.cpu_count() or 8
+PARALLEL_TARGETS = min(8, N_CPUS)
+THREADS_PER_MODEL = max(1, N_CPUS // PARALLEL_TARGETS)
 
 # Optuna-tuned params (L7, 30 trials)
 LGBM_PARAMS = dict(
@@ -44,9 +51,43 @@ LGBM_PARAMS = dict(
     subsample_freq=2,
     random_state=SEED,
     verbose=-1,
-    n_jobs=48,
+    # ── Speed optimizations for 2260 features ──
+    force_col_wise=True,       # faster for #features >> #rows/1000
+    min_data_in_bin=50,        # fewer bin boundaries → faster histogram build (default=20)
+    max_bin=127,               # half the default (255) → 2x faster histogram, minimal AUC loss
 )
 EARLY_STOPPING_ROUNDS = 100
+
+
+def _train_one_target(args):
+    """Train a single target — runs in a worker process."""
+    (X_tr, y_tr_col, X_val, y_val_col, X_test,
+     cat_indices, supports_cat, device_params,
+     target_name, fold_idx, threads) = args
+
+    params = {**LGBM_PARAMS, "n_jobs": threads, **device_params}
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        model = lgb.LGBMClassifier(**params)
+        model.fit(
+            X_tr, y_tr_col,
+            eval_set=[(X_val, y_val_col)],
+            eval_metric="auc",
+            callbacks=[
+                lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False),
+                lgb.log_evaluation(period=0),
+            ],
+            categorical_feature=cat_indices if supports_cat else "auto",
+        )
+
+    val_preds = model.predict_proba(X_val)[:, 1]
+    test_preds = model.predict_proba(X_test)[:, 1]
+    model_path = str(MODELS_DIR / f"{target_name}_fold{fold_idx}.lgb")
+    model.booster_.save_model(model_path)
+    importance = model.booster_.feature_importance(importance_type="gain")
+
+    return val_preds, test_preds, importance
 
 
 def main():
@@ -57,12 +98,14 @@ def main():
 
     device_params, device_name, supports_cat = detect_lgbm_device()
     print(f"  LightGBM device_type: {device_name}")
+    print(f"  Parallelism: {PARALLEL_TARGETS} targets × {THREADS_PER_MODEL} threads")
 
     # 1. Load features
     print("\n[1/4] Loading features...")
     with open(FEATURES_DIR / "meta.json") as f:
         meta = json.load(f)
-    feature_cols = meta["feature_names"]
+    all_feature_cols = meta["feature_names"]  # full list — never changes
+    feature_cols = list(all_feature_cols)
     cat_feature_names = meta["cat_cols"]
     target_cols = meta["target_cols"]
     cat_indices = [feature_cols.index(c) for c in cat_feature_names]
@@ -74,6 +117,22 @@ def main():
     X_train = train_feat.drop("customer_id").to_numpy().astype(np.float32)
     X_test = test_feat.drop("customer_id").to_numpy().astype(np.float32)
     y_train = train_tgt.select(target_cols).to_numpy().astype(np.float32)
+
+    # Prune zero-importance features from previous run
+    keep_idx, n_dropped = load_zero_importance_mask(
+        CHECKPOINT_DIR / "feature_importances.json", all_feature_cols
+    )
+    if keep_idx is not None:
+        X_train = X_train[:, keep_idx]
+        X_test = X_test[:, keep_idx]
+        # Remap cat indices
+        keep_set = set(keep_idx.tolist())
+        cat_indices = [np.searchsorted(keep_idx, old_i)
+                       for old_i in cat_indices if old_i in keep_set]
+        feature_cols = [all_feature_cols[i] for i in keep_idx]
+        cat_feature_names = [c for c in feature_cols if c.startswith("cat_feature")]
+        print(f"  Pruned {n_dropped} zero-importance features → {len(feature_cols)} remaining")
+
     print(f"  X_train: {X_train.shape}, X_test: {X_test.shape}")
     print(f"  Features: {len(cat_feature_names)} cat, {len(feature_cols) - len(cat_feature_names)} num")
 
@@ -91,7 +150,6 @@ def main():
     oof_preds = np.zeros((n_train, n_targets))
     test_preds_sum = np.zeros((n_test, n_targets))
     fold_aucs = []
-    # Accumulate feature importances (gain) across folds
     importance_sum = np.zeros((len(feature_cols), n_targets), dtype=np.float64)
 
     kf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
@@ -106,33 +164,29 @@ def main():
         y_tr, y_val = y_train[tr_idx], y_train[val_idx]
         fold_test_preds = np.zeros((n_test, n_targets))
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            for i, col in enumerate(target_cols):
-                model = lgb.LGBMClassifier(**LGBM_PARAMS, **device_params)
-                model.fit(
-                    X_tr, y_tr[:, i],
-                    eval_set=[(X_val, y_val[:, i])],
-                    eval_metric="auc",
-                    callbacks=[
-                        lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False),
-                        lgb.log_evaluation(period=0),
-                    ],
-                    categorical_feature=cat_indices if supports_cat else "auto",
-                )
-                oof_preds[val_idx, i] = model.predict_proba(X_val)[:, 1]
-                fold_test_preds[:, i] = model.predict_proba(X_test)[:, 1]
+        # Build args for all targets
+        task_args = []
+        for i, col in enumerate(target_cols):
+            task_args.append((
+                X_tr, y_tr[:, i], X_val, y_val[:, i], X_test,
+                cat_indices, supports_cat, device_params,
+                col, fold_idx, THREADS_PER_MODEL,
+            ))
 
-                # Save model weights
-                model_path = MODELS_DIR / f"{col}_fold{fold_idx}.lgb"
-                model.booster_.save_model(str(model_path))
-
-                # Accumulate feature importances (gain)
-                importance_sum[:, i] += model.booster_.feature_importance(importance_type="gain")
-
-                del model
-                if (i + 1) % 10 == 0 or i == n_targets - 1:
-                    print(f"    {i+1}/{n_targets} targets done", flush=True)
+        # Parallel training across targets
+        with ProcessPoolExecutor(max_workers=PARALLEL_TARGETS) as executor:
+            futures = {executor.submit(_train_one_target, a): i
+                       for i, a in enumerate(task_args)}
+            done_count = 0
+            for future in as_completed(futures):
+                i = futures[future]
+                val_p, test_p, imp = future.result()
+                oof_preds[val_idx, i] = val_p
+                fold_test_preds[:, i] = test_p
+                importance_sum[:, i] += imp
+                done_count += 1
+                if done_count % 10 == 0 or done_count == n_targets:
+                    print(f"    {done_count}/{n_targets} targets done", flush=True)
 
         fold_auc, _ = compute_macro_auc(y_val, oof_preds[val_idx], target_cols)
         test_preds_sum += fold_test_preds
@@ -143,31 +197,39 @@ def main():
     test_preds_avg = test_preds_sum / N_FOLDS
 
     # 4. Results
-    oof_auc, _ = compute_macro_auc(y_train, oof_preds, target_cols)
+    oof_auc, per_target_aucs = compute_macro_auc(y_train, oof_preds, target_cols)
     print(f"\n[3/4] Results:")
     print(f"  Per-fold AUC: {['%.4f' % a for a in fold_aucs]}")
     print(f"  OOF Macro ROC-AUC: {oof_auc:.4f}")
+    log_per_target_auc(per_target_aucs, y_train, target_cols)
 
     # Save predictions
     np.savez(cache_file, oof_preds=oof_preds, test_preds=test_preds_avg,
              fold_aucs=np.array(fold_aucs))
     print(f"  Saved: {cache_file}")
 
-    # Save averaged feature importances
+    # Save averaged feature importances — always keyed by full feature list
+    # so pruning is stable across re-runs (pruned features stay at 0)
     importance_avg = importance_sum / N_FOLDS
+    full_imp = np.zeros((len(all_feature_cols), n_targets), dtype=np.float64)
+    if keep_idx is not None:
+        full_imp[keep_idx] = importance_avg
+    else:
+        full_imp = importance_avg
+
     imp_path = CHECKPOINT_DIR / "feature_importances.json"
     imp_data = {
-        "feature_names": feature_cols,
+        "feature_names": all_feature_cols,
         "target_cols": target_cols,
         "importances_per_target": {
             col: dict(sorted(
-                zip(feature_cols, importance_avg[:, i].tolist()),
+                zip(all_feature_cols, full_imp[:, i].tolist()),
                 key=lambda x: x[1], reverse=True
             ))
             for i, col in enumerate(target_cols)
         },
         "mean_importance": dict(sorted(
-            zip(feature_cols, importance_avg.mean(axis=1).tolist()),
+            zip(all_feature_cols, full_imp.mean(axis=1).tolist()),
             key=lambda x: x[1], reverse=True
         )),
     }

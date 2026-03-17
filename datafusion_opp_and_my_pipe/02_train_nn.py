@@ -24,7 +24,7 @@ from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 from sklearn.preprocessing import QuantileTransformer
 from torch.utils.data import DataLoader, TensorDataset
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, get_device
+from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc, get_device
 
 DEVICE = get_device()
 FEATURES_DIR = Path("features")
@@ -33,9 +33,9 @@ CHECKPOINT_DIR = Path("checkpoints_nn")
 # ── Hyperparameters ───────────────────────────────────────────────
 BATCH_SIZE = 1024
 EPOCHS = 50
-LR = 5e-4
-WEIGHT_DECAY = 1e-3
-PATIENCE = 10
+LR = 3e-4
+WEIGHT_DECAY = 5e-3
+PATIENCE = 7
 GRAD_CLIP = 1.0
 HIDDEN_DIM = 384
 
@@ -300,16 +300,16 @@ class TabularNet(nn.Module):
             nn.Linear(input_dim, HIDDEN_DIM), nn.BatchNorm1d(HIDDEN_DIM), nn.SiLU(),
         )
         self.res_blocks = nn.ModuleList([
+            ResidualBlockBE(HIDDEN_DIM, k, dropout=0.5),
+            ResidualBlockBE(HIDDEN_DIM, k, dropout=0.5),
             ResidualBlockBE(HIDDEN_DIM, k, dropout=0.4),
-            ResidualBlockBE(HIDDEN_DIM, k, dropout=0.4),
-            ResidualBlockBE(HIDDEN_DIM, k, dropout=0.3),
         ])
         head_dim = HIDDEN_DIM // 2
         self.head_bn1 = nn.BatchNorm1d(HIDDEN_DIM)
-        self.head_drop1 = nn.Dropout(0.2)
+        self.head_drop1 = nn.Dropout(0.3)
         self.head_lin1 = LinearBE(HIDDEN_DIM, head_dim, k)
         self.head_bn2 = nn.BatchNorm1d(head_dim)
-        self.head_drop2 = nn.Dropout(0.1)
+        self.head_drop2 = nn.Dropout(0.15)
         self.head_lin2 = LinearBE(head_dim, n_targets, k)
         self.act = nn.SiLU()
 
@@ -459,7 +459,7 @@ def train_one_fold(fold_idx, tr_cat, tr_num, tr_y, val_cat, val_num, val_y,
     model.plr.set_bins(tr_num.numpy())
     criterion = AsymmetricLoss(ASL_GAMMA_NEG, ASL_GAMMA_POS, ASL_CLIP)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=2)
 
     best_auc, patience_counter = 0, 0
     top_states = []
@@ -672,9 +672,10 @@ def main():
     # 5. Evaluation
     print(f"\n[5/5] Evaluation...", flush=True)
     oof_y = train_tgt.select(target_cols).to_numpy().astype(np.float32)
-    oof_auc, _ = compute_macro_auc(oof_y, oof_preds, target_cols)
+    oof_auc, per_target_aucs = compute_macro_auc(oof_y, oof_preds, target_cols)
     print(f"  Per-fold AUC: {['%.4f' % a for a in fold_aucs]}")
     print(f"  OOF Macro ROC-AUC: {oof_auc:.4f}")
+    log_per_target_auc(per_target_aucs, oof_y, target_cols)
 
     # Save submission
     test_preds_avg = test_preds_sum / N_FOLDS

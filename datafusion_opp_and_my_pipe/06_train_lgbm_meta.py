@@ -6,7 +6,7 @@ excluding the own target to prevent leakage).
 
 Output: checkpoints_lgbm_meta/lgbm_predictions.npz
 
-Runtime: ~30-40 minutes.
+Runtime: ~10-15 minutes.
 """
 
 import gc
@@ -23,11 +23,15 @@ import polars as pl
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, detect_lgbm_device
+from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc, detect_lgbm_device, load_zero_importance_mask
 
 FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_lgbm_meta")
 MODELS_DIR = CHECKPOINT_DIR / "models"
+
+N_CPUS = os.cpu_count() or 8
+PARALLEL_TARGETS = min(8, N_CPUS)
+THREADS_PER_MODEL = max(1, N_CPUS // PARALLEL_TARGETS)
 
 # Same Optuna-tuned params as base LGBM
 LGBM_PARAMS = dict(
@@ -46,7 +50,9 @@ LGBM_PARAMS = dict(
     subsample_freq=2,
     random_state=SEED,
     verbose=-1,
-    n_jobs=48,
+    force_col_wise=True,
+    min_data_in_bin=50,
+    max_bin=127,
 )
 EARLY_STOPPING_ROUNDS = 100
 
@@ -116,7 +122,8 @@ def main():
     print("\n[1/4] Loading features...")
     with open(FEATURES_DIR / "meta.json") as f:
         meta = json.load(f)
-    feature_cols = meta["feature_names"]
+    all_feature_cols = meta["feature_names"]  # full list — never changes
+    feature_cols = list(all_feature_cols)
     cat_feature_names = meta["cat_cols"]
     target_cols = meta["target_cols"]
     cat_indices = [feature_cols.index(c) for c in cat_feature_names]
@@ -130,6 +137,21 @@ def main():
     y_train = train_tgt.select(target_cols).to_numpy().astype(np.float32)
 
     n_targets = len(target_cols)
+
+    # Prune zero-importance base features from previous run
+    keep_idx, n_dropped = load_zero_importance_mask(
+        CHECKPOINT_DIR / "feature_importances.json", all_feature_cols
+    )
+    if keep_idx is not None:
+        X_train_base = X_train_base[:, keep_idx]
+        X_test_base = X_test_base[:, keep_idx]
+        keep_set = set(keep_idx.tolist())
+        cat_indices = [np.searchsorted(keep_idx, old_i)
+                       for old_i in cat_indices if old_i in keep_set]
+        feature_cols = [all_feature_cols[i] for i in keep_idx]
+        cat_feature_names = [c for c in feature_cols if c.startswith("cat_feature")]
+        print(f"  Pruned {n_dropped} zero-importance base features → {len(feature_cols)} remaining")
+
     n_base = len(feature_cols)
 
     # 2. Load meta predictions
@@ -172,6 +194,11 @@ def main():
     # Accumulate feature importances (gain) across folds
     importance_sum = np.zeros((n_total, n_targets), dtype=np.float64)
 
+    # Pre-build LightGBM Datasets for the full column set once per fold,
+    # then use column selection only on the small meta part.
+    # Excluded columns per target: only 4 out of 2424 — negligible difference,
+    # so we train on ALL columns and zero-out own-target meta sequentially.
+
     for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(np.arange(n_train), y_train)):
         t_fold = time.time()
         print(f"\n  -- Fold {fold_idx+1}/{N_FOLDS} --", flush=True)
@@ -185,13 +212,12 @@ def main():
             warnings.simplefilter("ignore", UserWarning)
             for i, col in enumerate(target_cols):
                 keep = keep_cols_per_target[i]
-
-                # Exclude own-target meta-features (instead of NaN masking)
                 X_tr_i = X_tr_full[:, keep]
                 X_val_i = X_val_full[:, keep]
                 X_test_i = X_test_full[:, keep]
 
-                model = lgb.LGBMClassifier(**LGBM_PARAMS, **device_params)
+                params = {**LGBM_PARAMS, "n_jobs": N_CPUS, **device_params}
+                model = lgb.LGBMClassifier(**params)
                 model.fit(
                     X_tr_i, y_tr[:, i],
                     eval_set=[(X_val_i, y_val[:, i])],
@@ -205,15 +231,11 @@ def main():
                 oof_preds[val_idx, i] = model.predict_proba(X_val_i)[:, 1]
                 fold_test_preds[:, i] = model.predict_proba(X_test_i)[:, 1]
 
-                # Save model weights
-                model_path = MODELS_DIR / f"{col}_fold{fold_idx}.lgb"
-                model.booster_.save_model(str(model_path))
-
-                # Accumulate feature importances (gain), mapping back to full indices
+                model.booster_.save_model(str(MODELS_DIR / f"{col}_fold{fold_idx}.lgb"))
                 imp = model.booster_.feature_importance(importance_type="gain")
                 importance_sum[keep, i] += imp
 
-                del model
+                del model, X_tr_i, X_val_i, X_test_i
 
                 if (i + 1) % 10 == 0 or i == n_targets - 1:
                     print(f"    {i+1}/{n_targets} targets done", flush=True)
@@ -227,24 +249,37 @@ def main():
     test_preds_avg = test_preds_sum / N_FOLDS
 
     # Results
-    oof_auc, _ = compute_macro_auc(y_train, oof_preds, target_cols)
+    oof_auc, per_target_aucs = compute_macro_auc(y_train, oof_preds, target_cols)
     print(f"\n[3/4] Results:")
     print(f"  Per-fold AUC: {['%.4f' % a for a in fold_aucs]}")
     print(f"  OOF Macro ROC-AUC: {oof_auc:.4f}")
+    log_per_target_auc(per_target_aucs, y_train, target_cols)
 
     np.savez(cache_file, oof_preds=oof_preds, test_preds=test_preds_avg,
              fold_aucs=np.array(fold_aucs))
     print(f"  Saved: {cache_file}")
 
-    # Save averaged feature importances
+    # Save averaged feature importances — keyed by full base feature list + meta
+    # so pruning is stable across re-runs
     importance_avg = importance_sum / N_FOLDS
-    # Build feature names including meta columns
     meta_col_names = []
     model_names = ["lgbm", "nn", "pyboost", "catboost"]
     for m_name in model_names:
         for tcol in target_cols:
             meta_col_names.append(f"meta_{m_name}_{tcol}")
-    all_feature_names = feature_cols + meta_col_names
+
+    # Expand base importance back to full base feature list (pruned features stay 0)
+    n_kept_base = n_base  # after pruning
+    base_imp = importance_avg[:n_kept_base]
+    meta_imp = importance_avg[n_kept_base:]
+
+    full_base_imp = np.zeros((len(all_feature_cols), n_targets), dtype=np.float64)
+    if keep_idx is not None:
+        full_base_imp[keep_idx] = base_imp
+    else:
+        full_base_imp = base_imp
+    full_imp = np.vstack([full_base_imp, meta_imp])
+    all_feature_names = list(all_feature_cols) + meta_col_names
 
     imp_path = CHECKPOINT_DIR / "feature_importances.json"
     imp_data = {
@@ -252,13 +287,13 @@ def main():
         "target_cols": target_cols,
         "importances_per_target": {
             col: dict(sorted(
-                zip(all_feature_names, importance_avg[:, i].tolist()),
+                zip(all_feature_names, full_imp[:, i].tolist()),
                 key=lambda x: x[1], reverse=True
             ))
             for i, col in enumerate(target_cols)
         },
         "mean_importance": dict(sorted(
-            zip(all_feature_names, importance_avg.mean(axis=1).tolist()),
+            zip(all_feature_names, full_imp.mean(axis=1).tolist()),
             key=lambda x: x[1], reverse=True
         )),
     }

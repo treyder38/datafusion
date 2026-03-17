@@ -21,16 +21,16 @@ from catboost import CatBoostClassifier, Pool
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc
+from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc
 
 FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_catboost")
 MODELS_DIR = CHECKPOINT_DIR / "models"
 
-# CatBoost hyperparameters
+# CatBoost hyperparameters — defaults, overridden by best_params.json if present
 CB_PARAMS = dict(
-    iterations=2000,
-    early_stopping_rounds=80,
+    iterations=3000,
+    early_stopping_rounds=100,
     learning_rate=0.05,
     depth=6,
     l2_leaf_reg=3.0,
@@ -44,6 +44,17 @@ CB_PARAMS = dict(
     eval_metric="AUC",
     verbose=0,
 )
+
+# Load Optuna-tuned params if available
+_best_params_path = CHECKPOINT_DIR / "best_params.json"
+if _best_params_path.exists():
+    with open(_best_params_path) as _f:
+        _tuned = json.load(_f)
+    # Remove subsample if switching to Bayesian (incompatible)
+    if _tuned.get("bootstrap_type") == "Bayesian" and "subsample" in CB_PARAMS:
+        del CB_PARAMS["subsample"]
+    CB_PARAMS.update(_tuned)
+    print(f"  Loaded tuned params from {_best_params_path}")
 
 
 
@@ -157,10 +168,11 @@ def main():
     test_preds_avg = test_preds_sum / N_FOLDS
 
     # 4. Results
-    oof_auc, _ = compute_macro_auc(y_train, oof_preds, target_cols)
+    oof_auc, per_target_aucs = compute_macro_auc(y_train, oof_preds, target_cols)
     print(f"\n[3/4] Results:")
     print(f"  Per-fold AUC: {['%.4f' % a for a in fold_aucs]}")
     print(f"  OOF Macro ROC-AUC: {oof_auc:.4f}")
+    log_per_target_auc(per_target_aucs, y_train, target_cols)
 
     # Save predictions
     np.savez(cache_file, oof_preds=oof_preds, test_preds=test_preds_avg,

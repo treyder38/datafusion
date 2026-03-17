@@ -19,7 +19,7 @@ import polars as pl
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc
+from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc
 
 FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_pyboost")
@@ -126,10 +126,11 @@ def main():
         cp.get_default_memory_pool().free_all_blocks(); gc.collect()
 
     # 4. Results
-    macro_auc, _ = compute_macro_auc(y, oof_preds, target_cols)
+    macro_auc, per_target_aucs = compute_macro_auc(y, oof_preds, target_cols)
     print(f"\n[3/4] Results:")
     print(f"  Per-fold AUC: {['%.4f' % s for s in fold_scores]}")
     print(f"  OOF Macro ROC-AUC: {macro_auc:.4f}")
+    log_per_target_auc(per_target_aucs, y, target_cols)
 
     # Save
     np.savez_compressed(cache_file,

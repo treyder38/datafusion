@@ -65,9 +65,79 @@ def compute_macro_auc(y_true, y_pred, target_cols):
     return float(np.mean(list(aucs.values()))), aucs
 
 
+def log_per_target_auc(aucs, y_true, target_cols, top_worst=5):
+    """Log per-target AUC breakdown with weak target warnings.
+
+    Args:
+        aucs: dict {target_name: auc} from compute_macro_auc.
+        y_true: (n_samples, n_targets) array for pos_rate calculation.
+        target_cols: list of target names.
+        top_worst: number of worst targets to highlight.
+    """
+    if not aucs:
+        return
+
+    sorted_targets = sorted(aucs.items(), key=lambda x: x[1])
+    n_targets = len(target_cols)
+
+    # Pos rates
+    pos_rates = {}
+    for i, col in enumerate(target_cols):
+        pos_rates[col] = float(y_true[:, i].mean())
+
+    # Worst targets
+    worst = sorted_targets[:top_worst]
+    print(f"\n  Per-target AUC ({n_targets} targets):")
+    print(f"    Best:  {sorted_targets[-1][0]} = {sorted_targets[-1][1]:.4f}")
+    print(f"    Worst: {sorted_targets[0][0]} = {sorted_targets[0][1]:.4f}")
+    print(f"    Std:   {np.std(list(aucs.values())):.4f}")
+
+    print(f"\n  Weak targets (bottom {top_worst}):")
+    for col, auc in worst:
+        pr = pos_rates.get(col, 0)
+        flag = " *** CRITICAL" if auc < 0.70 else " ** LOW" if auc < 0.75 else ""
+        print(f"    {col:<12s}  AUC={auc:.4f}  pos_rate={pr:.4f} ({pr*100:.1f}%){flag}")
+
+    # Quantile summary
+    auc_values = np.array(list(aucs.values()))
+    print(f"\n  Distribution: min={auc_values.min():.4f}  Q25={np.percentile(auc_values, 25):.4f}  "
+          f"median={np.median(auc_values):.4f}  Q75={np.percentile(auc_values, 75):.4f}  "
+          f"max={auc_values.max():.4f}")
+
+
 def to_ranks(arr):
     """Convert predictions to per-column ranks."""
     return np.column_stack([rankdata(arr[:, i]) for i in range(arr.shape[1])])
+
+
+def load_zero_importance_mask(importances_json, feature_names):
+    """Return boolean mask and list of indices for features with non-zero mean importance.
+
+    Args:
+        importances_json: Path to feature_importances.json from a previous run.
+        feature_names: list of feature names in the current feature matrix.
+
+    Returns:
+        (keep_indices, dropped_count) or (None, 0) if file doesn't exist.
+    """
+    import json
+    from pathlib import Path
+
+    path = Path(importances_json)
+    if not path.exists():
+        return None, 0
+
+    with open(path) as f:
+        data = json.load(f)
+
+    mean_imp = data.get("mean_importance", {})
+    if not mean_imp:
+        return None, 0
+
+    zero_features = {name for name, val in mean_imp.items() if val == 0.0}
+    keep = [i for i, name in enumerate(feature_names) if name not in zero_features]
+    dropped = len(feature_names) - len(keep)
+    return np.array(keep, dtype=np.int64) if dropped > 0 else None, dropped
 
 
 def verify_submission(submit, sample):

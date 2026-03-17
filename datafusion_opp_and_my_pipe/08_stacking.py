@@ -20,7 +20,7 @@ import polars as pl
 from scipy.stats import rankdata
 from sklearn.linear_model import Ridge
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import KFold
+from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
 from utils import (
     SEED,
@@ -55,7 +55,7 @@ def stack_ridge(X_train, y_train, X_test, target_cols):
     oof_preds = np.zeros((n_train, n_targets), dtype=np.float32)
     test_preds = np.zeros((n_test, n_targets), dtype=np.float32)
 
-    kf = KFold(n_splits=N_META_FOLDS, shuffle=True, random_state=SEED)
+    kf = MultilabelStratifiedKFold(n_splits=N_META_FOLDS, shuffle=True, random_state=SEED)
     alphas = [0.01, 0.1, 1.0, 10.0, 100.0]
     t0 = time.time()
 
@@ -66,7 +66,7 @@ def stack_ridge(X_train, y_train, X_test, target_cols):
         for alpha in alphas:
             fold_oof = np.zeros(n_train, dtype=np.float32)
             fold_test = np.zeros(n_test, dtype=np.float32)
-            for tr_idx, val_idx in kf.split(range(n_train)):
+            for tr_idx, val_idx in kf.split(np.arange(n_train), y_train):
                 model = Ridge(alpha=alpha, random_state=SEED)
                 model.fit(X_train[tr_idx], y_t[tr_idx])
                 fold_oof[val_idx] = model.predict(X_train[val_idx])
@@ -100,7 +100,7 @@ def stack_lgbm_meta(X_train, y_train, X_test, target_cols, device_params):
     oof_preds = np.zeros((n_train, n_targets), dtype=np.float32)
     test_preds = np.zeros((n_test, n_targets), dtype=np.float32)
 
-    kf = KFold(n_splits=N_META_FOLDS, shuffle=True, random_state=SEED)
+    kf = MultilabelStratifiedKFold(n_splits=N_META_FOLDS, shuffle=True, random_state=SEED)
     params = dict(objective="binary", metric="auc", num_leaves=8, max_depth=3,
                   learning_rate=0.05, n_estimators=200, subsample=0.8,
                   colsample_bytree=0.8, reg_alpha=1.0, reg_lambda=1.0,
@@ -109,7 +109,7 @@ def stack_lgbm_meta(X_train, y_train, X_test, target_cols, device_params):
     t0 = time.time()
     for t_idx in range(n_targets):
         y_t = y_train[:, t_idx]
-        for tr_idx, val_idx in kf.split(range(n_train)):
+        for tr_idx, val_idx in kf.split(np.arange(n_train), y_train):
             model = lgb.LGBMClassifier(**params, **device_params)
             model.fit(X_train[tr_idx], y_t[tr_idx],
                       eval_set=[(X_train[val_idx], y_t[val_idx])],

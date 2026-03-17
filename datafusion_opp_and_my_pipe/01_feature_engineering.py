@@ -18,11 +18,14 @@ import polars as pl
 from scipy.sparse import csr_matrix, hstack as sparse_hstack
 from sklearn.decomposition import TruncatedSVD
 
-from utils import SEED, DATA_DIR
+from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
+
+from utils import SEED, DATA_DIR, N_FOLDS
 
 FEATURES_DIR = Path("features")
 NULL_PCA_COMPONENTS = 20
 INDIVIDUAL_NULL_THRESHOLD = 0.05
+TE_SMOOTHING = 20  # smoothing factor for target encoding
 
 # ── Feature Engineering Config ────────────────────────────────────
 
@@ -323,6 +326,127 @@ def add_row_stats(df, num_cols, prefix):
     ])
 
 
+def _compute_smoothed_te(cat_array, y_matrix, global_means, smoothing):
+    """Vectorized smoothed target encoding: returns (n_unique, n_targets) map + cat_vals."""
+    unique_cats = np.unique(cat_array[~np.isnan(cat_array)]) if np.issubdtype(
+        cat_array.dtype, np.floating) else np.unique(cat_array)
+
+    te_map = {}
+    for cat_val in unique_cats:
+        mask = cat_array == cat_val
+        count = mask.sum()
+        target_sums = y_matrix[mask].sum(axis=0)
+        # smoothed = (count * mean + smoothing * global) / (count + smoothing)
+        # = (sum + smoothing * global) / (count + smoothing)
+        smoothed = (target_sums + smoothing * global_means) / (count + smoothing)
+        te_map[cat_val] = smoothed.astype(np.float32)
+    return te_map
+
+
+def _apply_te_map(cat_array, te_map, n_targets):
+    """Apply te_map to an array of category values, returns (n_samples, n_targets)."""
+    result = np.full((len(cat_array), n_targets), np.nan, dtype=np.float32)
+    for cat_val, smoothed in te_map.items():
+        mask = cat_array == cat_val
+        if mask.any():
+            result[mask] = smoothed
+    return result
+
+
+def add_target_encoding_oof(train_df, test_df, cat_cols, train_tgt, target_cols,
+                            smoothing=TE_SMOOTHING):
+    """OOF-safe target encoding: mean across all targets per cat value (1 feature per cat).
+
+    For train: 5-fold OOF.  For test: full train encoding.
+    """
+    n_train = train_df.height
+    y = train_tgt.select(target_cols).to_numpy().astype(np.float32)
+    global_means = y.mean(axis=0)
+    n_targets = len(target_cols)
+
+    kf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    folds = list(kf.split(np.arange(n_train), y))
+
+    te_train_arrays = []
+    te_test_arrays = []
+    te_col_names = []
+
+    for cat_col in cat_cols:
+        train_cat = train_df[cat_col].to_numpy()
+        test_cat = test_df[cat_col].to_numpy()
+        cat_id = cat_col.replace("cat_feature_", "")
+
+        # OOF encoding
+        oof_te = np.full((n_train, n_targets), np.nan, dtype=np.float32)
+        for tr_idx, val_idx in folds:
+            te_map = _compute_smoothed_te(train_cat[tr_idx], y[tr_idx], global_means, smoothing)
+            oof_te[val_idx] = _apply_te_map(train_cat[val_idx], te_map, n_targets)
+
+        # Test encoding from full train
+        te_map_full = _compute_smoothed_te(train_cat, y, global_means, smoothing)
+        test_te = _apply_te_map(test_cat, te_map_full, n_targets)
+
+        # Mean across targets → 1 feature per cat
+        te_train_arrays.append(np.nanmean(oof_te, axis=1).astype(np.float32))
+        te_test_arrays.append(np.nanmean(test_te, axis=1).astype(np.float32))
+        te_col_names.append(f"te_mean_{cat_id}")
+
+    te_train_np = np.column_stack(te_train_arrays)
+    te_test_np = np.column_stack(te_test_arrays)
+
+    train_df = train_df.hstack(pl.DataFrame(te_train_np, schema=te_col_names))
+    test_df = test_df.hstack(pl.DataFrame(te_test_np, schema=te_col_names))
+    return train_df, test_df, te_col_names
+
+
+def add_per_target_te_oof(train_df, test_df, cat_cols, train_tgt, target_cols,
+                          smoothing=TE_SMOOTHING):
+    """Per-target OOF target encoding for a small set of important cat features.
+
+    Returns n_cats × n_targets features.
+    """
+    n_train = train_df.height
+    y = train_tgt.select(target_cols).to_numpy().astype(np.float32)
+    global_means = y.mean(axis=0)
+    n_targets = len(target_cols)
+
+    kf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    folds = list(kf.split(np.arange(n_train), y))
+
+    all_train_te = []
+    all_test_te = []
+    all_names = []
+
+    for cat_col in cat_cols:
+        train_cat = train_df[cat_col].to_numpy()
+        test_cat = test_df[cat_col].to_numpy()
+        cat_id = cat_col.replace("cat_feature_", "")
+
+        # OOF
+        oof_te = np.full((n_train, n_targets), np.nan, dtype=np.float32)
+        for tr_idx, val_idx in folds:
+            te_map = _compute_smoothed_te(train_cat[tr_idx], y[tr_idx], global_means, smoothing)
+            oof_te[val_idx] = _apply_te_map(train_cat[val_idx], te_map, n_targets)
+
+        # Test from full train
+        te_map_full = _compute_smoothed_te(train_cat, y, global_means, smoothing)
+        test_te = _apply_te_map(test_cat, te_map_full, n_targets)
+
+        for t_idx in range(n_targets):
+            tname = target_cols[t_idx].replace("target_", "")
+            all_names.append(f"te_{cat_id}_{tname}")
+
+        all_train_te.append(oof_te)
+        all_test_te.append(test_te)
+
+    train_te_np = np.hstack(all_train_te).astype(np.float32)
+    test_te_np = np.hstack(all_test_te).astype(np.float32)
+
+    train_df = train_df.hstack(pl.DataFrame(train_te_np, schema=all_names))
+    test_df = test_df.hstack(pl.DataFrame(test_te_np, schema=all_names))
+    return train_df, test_df, all_names
+
+
 def remove_duplicate_cats(train_df, test_df, dup_cols):
     """Remove duplicate categorical features."""
     existing = [c for c in dup_cols if c in train_df.columns]
@@ -434,8 +558,23 @@ def main():
     test_extra = add_row_stats(test_extra, extra_num_for_stats, "extra")
     print(f"  + 4 row stats (main + extra std/skew)")
 
+    # Target encoding — mean across targets (1 per cat feature, OOF-safe)
+    train_main, test_main, te_mean_cols = add_target_encoding_oof(
+        train_main, test_main, cat_cols, train_tgt, target_cols
+    )
+    print(f"  + {len(te_mean_cols)} target encoding (mean) features")
+
+    # Per-target target encoding for top interaction cats (OOF-safe)
+    TE_TOP_CATS = [c for c in ["cat_feature_66", "cat_feature_46", "cat_feature_39",
+                                "cat_feature_48", "cat_feature_9", "cat_feature_52"]
+                   if c in cat_cols]
+    train_main, test_main, te_pt_cols = add_per_target_te_oof(
+        train_main, test_main, TE_TOP_CATS, train_tgt, target_cols
+    )
+    print(f"  + {len(te_pt_cols)} per-target TE features ({len(TE_TOP_CATS)} cats × {len(target_cols)} targets)")
+
     # 6. Join main + extra + null PCA
-    print("\n[6/8] Joining features...")
+    print("\n[6/9] Joining features...")
     train_feat = train_main.join(train_extra, on="customer_id")
     test_feat = test_main.join(test_extra, on="customer_id")
     del train_main, train_extra, test_main, test_extra; gc.collect()
@@ -453,13 +592,13 @@ def main():
           f"({len(cat_feature_names)} cat, {len(num_feature_names)} num)")
 
     # 7. Save targets
-    print("\n[7/8] Saving targets...")
+    print("\n[7/9] Saving targets...")
     FEATURES_DIR.mkdir(exist_ok=True)
     targets = train_tgt.select(["customer_id"] + target_cols)
     targets.write_parquet(FEATURES_DIR / "targets.parquet")
 
     # 8. Save features + metadata
-    print("\n[8/8] Saving features...")
+    print("\n[8/9] Saving features...")
     train_feat.write_parquet(FEATURES_DIR / "train_features.parquet")
     test_feat.write_parquet(FEATURES_DIR / "test_features.parquet")
 
