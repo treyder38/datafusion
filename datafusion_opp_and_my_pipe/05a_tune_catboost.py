@@ -148,9 +148,15 @@ def main():
 
     print(f"  X_train: {X_train.shape}")
 
-    # Use first fold only for tuning
+    # Use first fold only for tuning, subsample train for speed
+    # (optimal hyperparams are stable across data sizes)
+    TUNE_TRAIN_SIZE = 150_000
     kf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     tr_idx, val_idx = next(iter(kf.split(np.arange(len(X_train)), y_train)))
+    if len(tr_idx) > TUNE_TRAIN_SIZE:
+        rng = np.random.RandomState(SEED)
+        tr_idx = rng.choice(tr_idx, size=TUNE_TRAIN_SIZE, replace=False)
+        tr_idx.sort()
     print(f"  Fold 1: train={len(tr_idx):,}, val={len(val_idx):,}")
 
     # Select diverse subset of targets (spread across different class ratios)
