@@ -146,7 +146,7 @@ def main():
         X_train_base = X_train_base[:, keep_idx]
         X_test_base = X_test_base[:, keep_idx]
         keep_set = set(keep_idx.tolist())
-        cat_indices = [np.searchsorted(keep_idx, old_i)
+        cat_indices = [int(np.searchsorted(keep_idx, old_i))
                        for old_i in cat_indices if old_i in keep_set]
         feature_cols = [all_feature_cols[i] for i in keep_idx]
         cat_feature_names = [c for c in feature_cols if c.startswith("cat_feature")]

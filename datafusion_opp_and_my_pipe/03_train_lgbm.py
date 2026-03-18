@@ -58,11 +58,21 @@ LGBM_PARAMS = dict(
 EARLY_STOPPING_ROUNDS = 100
 
 
+# Module-level shared data — fork() on Linux gives child processes
+# read-only access via copy-on-write, avoiding 8× pickle copies (~64 GB).
+_shared = {}
+
+
 def _train_one_target(args):
     """Train a single target — runs in a worker process."""
-    (X_tr, y_tr_col, X_val, y_val_col, X_test,
-     cat_indices, supports_cat, device_params,
-     target_name, fold_idx, threads) = args
+    (target_idx, target_name, fold_idx, threads,
+     cat_indices, supports_cat, device_params) = args
+
+    X_tr = _shared["X_tr"]
+    X_val = _shared["X_val"]
+    X_test = _shared["X_test"]
+    y_tr_col = _shared["y_tr"][:, target_idx]
+    y_val_col = _shared["y_val"][:, target_idx]
 
     params = {**LGBM_PARAMS, "n_jobs": threads, **device_params}
 
@@ -126,7 +136,7 @@ def main():
         X_test = X_test[:, keep_idx]
         # Remap cat indices
         keep_set = set(keep_idx.tolist())
-        cat_indices = [np.searchsorted(keep_idx, old_i)
+        cat_indices = [int(np.searchsorted(keep_idx, old_i))
                        for old_i in cat_indices if old_i in keep_set]
         feature_cols = [all_feature_cols[i] for i in keep_idx]
         cat_feature_names = [c for c in feature_cols if c.startswith("cat_feature")]
@@ -159,21 +169,22 @@ def main():
         print(f"\n  ── Fold {fold_idx+1}/{N_FOLDS} "
               f"(train={len(tr_idx):,}, val={len(val_idx):,}) ──", flush=True)
 
-        X_tr, X_val = X_train[tr_idx], X_train[val_idx]
-        y_tr, y_val = y_train[tr_idx], y_train[val_idx]
+        # Store fold data in module-level dict for fork()-based COW sharing
+        _shared["X_tr"] = X_train[tr_idx]
+        _shared["X_val"] = X_train[val_idx]
+        _shared["X_test"] = X_test
+        _shared["y_tr"] = y_train[tr_idx]
+        _shared["y_val"] = y_train[val_idx]
         fold_test_preds = np.zeros((n_test, n_targets))
 
         # Parallel training across targets on CPU
-        task_args = []
-        for i, col in enumerate(target_cols):
-            task_args.append((
-                X_tr, y_tr[:, i], X_val, y_val[:, i], X_test,
-                cat_indices, supports_cat, device_params,
-                col, fold_idx, THREADS_PER_MODEL,
-            ))
+        task_args = [(i, col, fold_idx, THREADS_PER_MODEL,
+                      cat_indices, supports_cat, device_params)
+                     for i, col in enumerate(target_cols)]
+
         with ProcessPoolExecutor(max_workers=PARALLEL_TARGETS) as executor:
-            futures = {executor.submit(_train_one_target, a): i
-                       for i, a in enumerate(task_args)}
+            futures = {executor.submit(_train_one_target, a): a[0]
+                       for a in task_args}
             done_count = 0
             for future in as_completed(futures):
                 i = futures[future]
@@ -185,10 +196,11 @@ def main():
                 if done_count % 10 == 0 or done_count == n_targets:
                     print(f"    {done_count}/{n_targets} targets done", flush=True)
 
+        y_val = _shared["y_val"]
         fold_auc, _ = compute_macro_auc(y_val, oof_preds[val_idx], target_cols)
         test_preds_sum += fold_test_preds
         fold_aucs.append(fold_auc)
-        del X_tr, X_val, y_tr, y_val; gc.collect()
+        _shared.clear(); gc.collect()
         print(f"  Fold {fold_idx+1} AUC={fold_auc:.4f} ({(time.time()-t_fold)/60:.1f} min)", flush=True)
 
     test_preds_avg = test_preds_sum / N_FOLDS
