@@ -30,8 +30,6 @@ CHECKPOINT_DIR = Path("checkpoints_lgbm_meta")
 MODELS_DIR = CHECKPOINT_DIR / "models"
 
 N_CPUS = os.cpu_count() or 8
-# Sequential training: use most cores but leave headroom
-THREADS_PER_MODEL = max(1, (N_CPUS * 2) // 3)  # 224 → 149
 
 # Same Optuna-tuned params as base LGBM
 LGBM_PARAMS = dict(
@@ -53,6 +51,7 @@ LGBM_PARAMS = dict(
     force_col_wise=True,
     max_bin=127,
     feature_pre_filter=True,
+    n_jobs=-1,
 )
 EARLY_STOPPING_ROUNDS = 100
 
@@ -219,7 +218,7 @@ def main():
                     X_val_full[:, c] = np.nan
                     X_test_full[:, c] = np.nan
 
-                params = {**LGBM_PARAMS, "n_jobs": THREADS_PER_MODEL, **device_params}
+                params = {**LGBM_PARAMS, **device_params}
                 model = lgb.LGBMClassifier(**params)
                 model.fit(
                     X_tr_full, y_tr[:, i],
