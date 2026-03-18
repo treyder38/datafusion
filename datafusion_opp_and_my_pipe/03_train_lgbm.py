@@ -14,7 +14,7 @@ import os
 import sys
 import time
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import lightgbm as lgb
@@ -29,11 +29,11 @@ FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_lgbm")
 MODELS_DIR = CHECKPOINT_DIR / "models"
 
-# How many targets to train in parallel
-# Use 75% of cores to avoid oversubscription (LightGBM OpenMP overhead)
+# ThreadPoolExecutor: LightGBM releases GIL during C++ training,
+# so threads are truly parallel. No data copying, no pickle overhead.
 N_CPUS = os.cpu_count() or 8
-PARALLEL_TARGETS = min(6, N_CPUS)
-THREADS_PER_MODEL = max(1, (N_CPUS * 3 // 4) // PARALLEL_TARGETS)
+PARALLEL_TARGETS = min(4, max(1, N_CPUS // 56))  # 224 cores → 4 parallel
+THREADS_PER_MODEL = max(1, N_CPUS // (PARALLEL_TARGETS * 2))  # 50% utilization to avoid oversubscription
 
 # Optuna-tuned params (L7, 30 trials)
 LGBM_PARAMS = dict(
@@ -59,30 +59,18 @@ LGBM_PARAMS = dict(
 EARLY_STOPPING_ROUNDS = 100
 
 
-# Module-level shared data — fork() on Linux gives child processes
-# read-only access via copy-on-write, avoiding 8× pickle copies (~64 GB).
-_shared = {}
-
-
-def _train_one_target(args):
-    """Train a single target — runs in a worker process."""
-    (target_idx, target_name, fold_idx, threads,
-     cat_indices, supports_cat, device_params) = args
-
-    X_tr = _shared["X_tr"]
-    X_val = _shared["X_val"]
-    X_test = _shared["X_test"]
-    y_tr_col = _shared["y_tr"][:, target_idx]
-    y_val_col = _shared["y_val"][:, target_idx]
-
+def _train_one_target(target_idx, target_name, fold_idx, threads,
+                      cat_indices, supports_cat, device_params,
+                      X_tr, y_tr, X_val, y_val, X_test):
+    """Train a single target — runs in a thread (GIL released by LightGBM C++)."""
     params = {**LGBM_PARAMS, "n_jobs": threads, **device_params}
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         model = lgb.LGBMClassifier(**params)
         model.fit(
-            X_tr, y_tr_col,
-            eval_set=[(X_val, y_val_col)],
+            X_tr, y_tr[:, target_idx],
+            eval_set=[(X_val, y_val[:, target_idx])],
             eval_metric="auc",
             callbacks=[
                 lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False),
@@ -93,8 +81,7 @@ def _train_one_target(args):
 
     val_preds = model.predict_proba(X_val)[:, 1]
     test_preds = model.predict_proba(X_test)[:, 1]
-    model_path = str(MODELS_DIR / f"{target_name}_fold{fold_idx}.lgb")
-    model.booster_.save_model(model_path)
+    model.booster_.save_model(str(MODELS_DIR / f"{target_name}_fold{fold_idx}.lgb"))
     importance = model.booster_.feature_importance(importance_type="gain")
 
     return val_preds, test_preds, importance
@@ -170,22 +157,23 @@ def main():
         print(f"\n  ── Fold {fold_idx+1}/{N_FOLDS} "
               f"(train={len(tr_idx):,}, val={len(val_idx):,}) ──", flush=True)
 
-        # Store fold data in module-level dict for fork()-based COW sharing
-        _shared["X_tr"] = X_train[tr_idx]
-        _shared["X_val"] = X_train[val_idx]
-        _shared["X_test"] = X_test
-        _shared["y_tr"] = y_train[tr_idx]
-        _shared["y_val"] = y_train[val_idx]
+        X_tr = X_train[tr_idx]
+        X_val = X_train[val_idx]
+        y_tr = y_train[tr_idx]
+        y_val = y_train[val_idx]
         fold_test_preds = np.zeros((n_test, n_targets))
 
-        # Parallel training across targets on CPU
-        task_args = [(i, col, fold_idx, THREADS_PER_MODEL,
-                      cat_indices, supports_cat, device_params)
-                     for i, col in enumerate(target_cols)]
-
-        with ProcessPoolExecutor(max_workers=PARALLEL_TARGETS) as executor:
-            futures = {executor.submit(_train_one_target, a): a[0]
-                       for a in task_args}
+        # Parallel training across targets using threads
+        # LightGBM releases GIL → threads are truly parallel, zero copy overhead
+        with ThreadPoolExecutor(max_workers=PARALLEL_TARGETS) as executor:
+            futures = {
+                executor.submit(
+                    _train_one_target, i, col, fold_idx, THREADS_PER_MODEL,
+                    cat_indices, supports_cat, device_params,
+                    X_tr, y_tr, X_val, y_val, X_test
+                ): i
+                for i, col in enumerate(target_cols)
+            }
             done_count = 0
             for future in as_completed(futures):
                 i = futures[future]
@@ -197,11 +185,10 @@ def main():
                 if done_count % 10 == 0 or done_count == n_targets:
                     print(f"    {done_count}/{n_targets} targets done", flush=True)
 
-        y_val = _shared["y_val"]
         fold_auc, _ = compute_macro_auc(y_val, oof_preds[val_idx], target_cols)
         test_preds_sum += fold_test_preds
         fold_aucs.append(fold_auc)
-        _shared.clear(); gc.collect()
+        del X_tr, X_val, y_tr, y_val; gc.collect()
         print(f"  Fold {fold_idx+1} AUC={fold_auc:.4f} ({(time.time()-t_fold)/60:.1f} min)", flush=True)
 
     test_preds_avg = test_preds_sum / N_FOLDS
