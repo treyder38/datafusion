@@ -29,10 +29,11 @@ FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_lgbm")
 MODELS_DIR = CHECKPOINT_DIR / "models"
 
-# How many targets to train in parallel (each gets N_CPUS // PARALLEL_TARGETS threads)
+# How many targets to train in parallel
+# Use 75% of cores to avoid oversubscription (LightGBM OpenMP overhead)
 N_CPUS = os.cpu_count() or 8
-PARALLEL_TARGETS = min(8, N_CPUS)
-THREADS_PER_MODEL = max(1, N_CPUS // PARALLEL_TARGETS)
+PARALLEL_TARGETS = min(6, N_CPUS)
+THREADS_PER_MODEL = max(1, (N_CPUS * 3 // 4) // PARALLEL_TARGETS)
 
 # Optuna-tuned params (L7, 30 trials)
 LGBM_PARAMS = dict(

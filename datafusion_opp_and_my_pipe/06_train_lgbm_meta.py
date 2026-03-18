@@ -30,8 +30,8 @@ CHECKPOINT_DIR = Path("checkpoints_lgbm_meta")
 MODELS_DIR = CHECKPOINT_DIR / "models"
 
 N_CPUS = os.cpu_count() or 8
-PARALLEL_TARGETS = min(8, N_CPUS)
-THREADS_PER_MODEL = max(1, N_CPUS // PARALLEL_TARGETS)
+PARALLEL_TARGETS = min(6, N_CPUS)
+THREADS_PER_MODEL = max(1, (N_CPUS * 3 // 4) // PARALLEL_TARGETS)
 
 # Same Optuna-tuned params as base LGBM
 LGBM_PARAMS = dict(
