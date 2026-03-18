@@ -32,8 +32,8 @@ MODELS_DIR = CHECKPOINT_DIR / "models"
 # ThreadPoolExecutor: LightGBM releases GIL during C++ training,
 # so threads are truly parallel. No data copying, no pickle overhead.
 N_CPUS = os.cpu_count() or 8
-PARALLEL_TARGETS = min(2, max(1, N_CPUS // 100))  # 224 cores → 2 parallel (memory bandwidth limited)
-THREADS_PER_MODEL = max(1, N_CPUS // (PARALLEL_TARGETS + 1))  # leave headroom for OS
+PARALLEL_TARGETS = min(4, max(2, N_CPUS // 16))  # 64 cores → 4 parallel, 224 → 4 (capped)
+THREADS_PER_MODEL = max(1, N_CPUS // PARALLEL_TARGETS)  # 64 cores / 4 = 16 threads each
 
 # Optuna-tuned params (L7, 30 trials)
 LGBM_PARAMS = dict(

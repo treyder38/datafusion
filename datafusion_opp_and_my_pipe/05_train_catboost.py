@@ -27,35 +27,14 @@ FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_catboost")
 MODELS_DIR = CHECKPOINT_DIR / "models"
 
-# CatBoost hyperparameters — defaults, overridden by best_params.json if present
+# CatBoost hyperparameters — CatBoost defaults, no Optuna override
 CB_PARAMS = dict(
-    iterations=3000,
-    early_stopping_rounds=100,
-    learning_rate=0.05,
-    depth=6,
-    l2_leaf_reg=3.0,
-    border_count=128,
-    max_ctr_complexity=1,
-    boosting_type="Plain",
-    bootstrap_type="MVS",
-    subsample=0.8,
-    random_strength=1.0,
+    iterations=5000,
+    early_stopping_rounds=200,
     loss_function="Logloss",
     eval_metric="AUC",
     verbose=0,
 )
-
-# Load Optuna-tuned params if available
-_best_params_path = CHECKPOINT_DIR / "best_params.json"
-if _best_params_path.exists():
-    with open(_best_params_path) as _f:
-        _tuned = json.load(_f)
-    # Remove subsample if switching to Bayesian (incompatible)
-    if _tuned.get("bootstrap_type") == "Bayesian" and "subsample" in CB_PARAMS:
-        del CB_PARAMS["subsample"]
-    CB_PARAMS.update(_tuned)
-    print(f"  Loaded tuned params from {_best_params_path}")
-
 
 
 def detect_task_type():
