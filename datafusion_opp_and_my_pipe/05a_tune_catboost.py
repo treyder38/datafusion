@@ -48,30 +48,31 @@ def objective(trial, X_train, y_train, tr_idx, val_idx,
               task_type, devices):
     """Optuna objective: train on 1 fold, evaluate on subset of targets."""
 
-    depth = trial.suggest_int("depth", 4, 10)
-    learning_rate = trial.suggest_float("learning_rate", 0.01, 0.15, log=True)
-    l2_leaf_reg = trial.suggest_float("l2_leaf_reg", 0.1, 30.0, log=True)
+    depth = trial.suggest_int("depth", 6, 10)
+    learning_rate = trial.suggest_float("learning_rate", 0.01, 0.1, log=True)
+    l2_leaf_reg = trial.suggest_float("l2_leaf_reg", 0.1, 50.0, log=True)
     random_strength = trial.suggest_float("random_strength", 0.1, 10.0, log=True)
     # GPU limits border_count to 128 and only supports SymmetricTree
     if task_type == "GPU":
-        border_count = trial.suggest_categorical("border_count", [32, 64, 128])
+        border_count = trial.suggest_categorical("border_count", [64, 128])
         grow_policy = "SymmetricTree"
     else:
-        border_count = trial.suggest_categorical("border_count", [32, 64, 128, 254])
+        border_count = trial.suggest_categorical("border_count", [64, 128, 254])
         grow_policy = trial.suggest_categorical("grow_policy", ["SymmetricTree", "Depthwise"])
-    max_ctr_complexity = trial.suggest_int("max_ctr_complexity", 1, 3)
-    min_data_in_leaf = trial.suggest_int("min_data_in_leaf", 1, 100, log=True)
+    max_ctr_complexity = trial.suggest_int("max_ctr_complexity", 1, 4)
+    min_data_in_leaf = trial.suggest_int("min_data_in_leaf", 10, 500, log=True)
+    boosting_type = trial.suggest_categorical("boosting_type", ["Plain", "Ordered"])
 
     bootstrap_type = trial.suggest_categorical("bootstrap_type", ["Bayesian", "MVS"])
     params = dict(
-        iterations=2000,
-        early_stopping_rounds=80,
+        iterations=5000,
+        early_stopping_rounds=150,
         learning_rate=learning_rate,
         depth=depth,
         l2_leaf_reg=l2_leaf_reg,
         border_count=border_count,
         max_ctr_complexity=max_ctr_complexity,
-        boosting_type="Plain",
+        boosting_type=boosting_type,
         bootstrap_type=bootstrap_type,
         random_strength=random_strength,
         min_data_in_leaf=min_data_in_leaf,
@@ -115,7 +116,7 @@ def objective(trial, X_train, y_train, tr_idx, val_idx,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-trials", type=int, default=50)
-    parser.add_argument("--n-targets", type=int, default=10,
+    parser.add_argument("--n-targets", type=int, default=20,
                         help="Number of targets to evaluate (subset for speed)")
     args = parser.parse_args()
 

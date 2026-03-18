@@ -30,8 +30,8 @@ CHECKPOINT_DIR = Path("checkpoints_lgbm_meta")
 MODELS_DIR = CHECKPOINT_DIR / "models"
 
 N_CPUS = os.cpu_count() or 8
-# Sequential training: each target uses half the cores to avoid oversubscription
-THREADS_PER_MODEL = max(1, N_CPUS // 2)
+# Sequential training: use most cores but leave headroom
+THREADS_PER_MODEL = max(1, (N_CPUS * 2) // 3)  # 224 → 149
 
 # Same Optuna-tuned params as base LGBM
 LGBM_PARAMS = dict(
@@ -52,6 +52,7 @@ LGBM_PARAMS = dict(
     verbose=-1,
     force_col_wise=True,
     max_bin=127,
+    feature_pre_filter=True,
 )
 EARLY_STOPPING_ROUNDS = 100
 
@@ -174,14 +175,11 @@ def main():
         print(f"\n  Predictions exist at {cache_file}! Delete to retrain.")
         return
 
-    # Precompute column indices to KEEP for each target
-    # For target_i: exclude columns [n_base + model_idx * n_targets + i] for each model
-    all_col_indices = np.arange(n_total)
-    keep_cols_per_target = []
+    # Precompute own-target meta column indices for NaN masking
+    # For target_i: mask columns [n_base + model_idx * n_targets + i] for each model
+    exclude_cols_per_target = []
     for i in range(n_targets):
-        exclude = {n_base + m * n_targets + i for m in range(n_models)}
-        keep = np.array([j for j in all_col_indices if j not in exclude])
-        keep_cols_per_target.append(keep)
+        exclude_cols_per_target.append([n_base + m * n_targets + i for m in range(n_models)])
 
     # 4. Train
     print(f"\n[2/4] Training {N_FOLDS}-Fold x {n_targets} targets (with meta)...", flush=True)
@@ -211,16 +209,21 @@ def main():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             for i, col in enumerate(target_cols):
-                keep = keep_cols_per_target[i]
-                X_tr_i = X_tr_full[:, keep]
-                X_val_i = X_val_full[:, keep]
-                X_test_i = X_test_full[:, keep]
+                # NaN-mask own-target meta columns (sequential — no race condition)
+                exclude_cols = exclude_cols_per_target[i]
+                saved = {}
+                for c in exclude_cols:
+                    saved[c] = (X_tr_full[:, c].copy(), X_val_full[:, c].copy(),
+                                X_test_full[:, c].copy())
+                    X_tr_full[:, c] = np.nan
+                    X_val_full[:, c] = np.nan
+                    X_test_full[:, c] = np.nan
 
                 params = {**LGBM_PARAMS, "n_jobs": THREADS_PER_MODEL, **device_params}
                 model = lgb.LGBMClassifier(**params)
                 model.fit(
-                    X_tr_i, y_tr[:, i],
-                    eval_set=[(X_val_i, y_val[:, i])],
+                    X_tr_full, y_tr[:, i],
+                    eval_set=[(X_val_full, y_val[:, i])],
                     eval_metric="auc",
                     callbacks=[
                         lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False),
@@ -228,14 +231,19 @@ def main():
                     ],
                     categorical_feature=cat_indices if supports_cat else "auto",
                 )
-                oof_preds[val_idx, i] = model.predict_proba(X_val_i)[:, 1]
-                fold_test_preds[:, i] = model.predict_proba(X_test_i)[:, 1]
+                oof_preds[val_idx, i] = model.predict_proba(X_val_full)[:, 1]
+                fold_test_preds[:, i] = model.predict_proba(X_test_full)[:, 1]
 
                 model.booster_.save_model(str(MODELS_DIR / f"{col}_fold{fold_idx}.lgb"))
                 imp = model.booster_.feature_importance(importance_type="gain")
-                importance_sum[keep, i] += imp
+                importance_sum[:, i] += imp
 
-                del model, X_tr_i, X_val_i, X_test_i
+                # Restore masked columns
+                for c in exclude_cols:
+                    X_tr_full[:, c] = saved[c][0]
+                    X_val_full[:, c] = saved[c][1]
+                    X_test_full[:, c] = saved[c][2]
+                del saved, model
 
                 if (i + 1) % 10 == 0 or i == n_targets - 1:
                     print(f"    {i+1}/{n_targets} targets done", flush=True)
