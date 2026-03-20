@@ -23,7 +23,7 @@ import polars as pl
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc, load_zero_importance_mask
+from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc
 
 FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_lgbm")
@@ -117,21 +117,6 @@ def main():
     X_test = test_feat.drop("customer_id").to_numpy().astype(np.float32)
     y_train = train_tgt.select(target_cols).to_numpy().astype(np.float32)
 
-    # Prune zero-importance features from previous run
-    keep_idx, n_dropped = load_zero_importance_mask(
-        CHECKPOINT_DIR / "feature_importances.json", all_feature_cols
-    )
-    if keep_idx is not None:
-        X_train = X_train[:, keep_idx]
-        X_test = X_test[:, keep_idx]
-        # Remap cat indices
-        keep_set = set(keep_idx.tolist())
-        cat_indices = [int(np.searchsorted(keep_idx, old_i))
-                       for old_i in cat_indices if old_i in keep_set]
-        feature_cols = [all_feature_cols[i] for i in keep_idx]
-        cat_feature_names = [c for c in feature_cols if c.startswith("cat_feature")]
-        print(f"  Pruned {n_dropped} zero-importance features → {len(feature_cols)} remaining")
-
     print(f"  X_train: {X_train.shape}, X_test: {X_test.shape}")
     print(f"  Features: {len(cat_feature_names)} cat, {len(feature_cols) - len(cat_feature_names)} num")
 
@@ -208,13 +193,8 @@ def main():
     print(f"  Saved: {cache_file}")
 
     # Save averaged feature importances — always keyed by full feature list
-    # so pruning is stable across re-runs (pruned features stay at 0)
     importance_avg = importance_sum / N_FOLDS
-    full_imp = np.zeros((len(all_feature_cols), n_targets), dtype=np.float64)
-    if keep_idx is not None:
-        full_imp[keep_idx] = importance_avg
-    else:
-        full_imp = importance_avg
+    full_imp = importance_avg
 
     imp_path = CHECKPOINT_DIR / "feature_importances.json"
     imp_data = {

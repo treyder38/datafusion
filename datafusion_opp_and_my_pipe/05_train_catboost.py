@@ -27,14 +27,40 @@ FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_catboost")
 MODELS_DIR = CHECKPOINT_DIR / "models"
 
-# CatBoost hyperparameters — CatBoost defaults, no Optuna override
-CB_PARAMS = dict(
+# CatBoost hyperparameters — load Optuna-tuned params if available
+CB_PARAMS_DEFAULT = dict(
     iterations=5000,
     early_stopping_rounds=200,
     loss_function="Logloss",
     eval_metric="AUC",
     verbose=0,
 )
+
+def load_cb_params():
+    """Load best params from Optuna tuning, fall back to defaults."""
+    params_path = CHECKPOINT_DIR / "best_params.json"
+    base = dict(CB_PARAMS_DEFAULT)
+    if params_path.exists():
+        with open(params_path) as f:
+            tuned = json.load(f)
+        print(f"  Loaded tuned params from {params_path}")
+        # Map Optuna params into CatBoost params
+        base.update({
+            k: v for k, v in tuned.items()
+            if k not in ("bootstrap_type",)
+        })
+        # Bootstrap params
+        bt = tuned.get("bootstrap_type", "Bayesian")
+        base["bootstrap_type"] = bt
+        if bt == "Bayesian" and "bagging_temperature" in tuned:
+            base["bagging_temperature"] = tuned["bagging_temperature"]
+        elif bt == "MVS" and "subsample" in tuned:
+            base["subsample"] = tuned["subsample"]
+        for k, v in tuned.items():
+            print(f"    {k}: {v}")
+    else:
+        print(f"  No tuned params found, using defaults")
+    return base
 
 
 def detect_task_type():
@@ -55,6 +81,8 @@ def main():
 
     task_type, devices = detect_task_type()
     print(f"  CatBoost task_type: {task_type}")
+
+    cb_params = load_cb_params()
 
     # 1. Load features
     print("\n[1/4] Loading features...")
@@ -111,7 +139,7 @@ def main():
         for i, col in enumerate(target_cols):
             y = y_train[:, i]
 
-            params = dict(CB_PARAMS)
+            params = dict(cb_params)
             params["random_seed"] = SEED + fold_idx
             if task_type == "GPU":
                 params["task_type"] = "GPU"

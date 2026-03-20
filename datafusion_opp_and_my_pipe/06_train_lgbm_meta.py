@@ -23,7 +23,7 @@ import polars as pl
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc, load_zero_importance_mask
+from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc
 
 FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_lgbm_meta")
@@ -137,20 +137,6 @@ def main():
     y_train = train_tgt.select(target_cols).to_numpy().astype(np.float32)
 
     n_targets = len(target_cols)
-
-    # Prune zero-importance base features from previous run
-    keep_idx, n_dropped = load_zero_importance_mask(
-        CHECKPOINT_DIR / "feature_importances.json", all_feature_cols
-    )
-    if keep_idx is not None:
-        X_train_base = X_train_base[:, keep_idx]
-        X_test_base = X_test_base[:, keep_idx]
-        keep_set = set(keep_idx.tolist())
-        cat_indices = [int(np.searchsorted(keep_idx, old_i))
-                       for old_i in cat_indices if old_i in keep_set]
-        feature_cols = [all_feature_cols[i] for i in keep_idx]
-        cat_feature_names = [c for c in feature_cols if c.startswith("cat_feature")]
-        print(f"  Pruned {n_dropped} zero-importance base features → {len(feature_cols)} remaining")
 
     n_base = len(feature_cols)
 
@@ -275,17 +261,9 @@ def main():
         for tcol in target_cols:
             meta_col_names.append(f"meta_{m_name}_{tcol}")
 
-    # Expand base importance back to full base feature list (pruned features stay 0)
-    n_kept_base = n_base  # after pruning
-    base_imp = importance_avg[:n_kept_base]
-    meta_imp = importance_avg[n_kept_base:]
-
-    full_base_imp = np.zeros((len(all_feature_cols), n_targets), dtype=np.float64)
-    if keep_idx is not None:
-        full_base_imp[keep_idx] = base_imp
-    else:
-        full_base_imp = base_imp
-    full_imp = np.vstack([full_base_imp, meta_imp])
+    base_imp = importance_avg[:n_base]
+    meta_imp = importance_avg[n_base:]
+    full_imp = np.vstack([base_imp, meta_imp])
     all_feature_names = list(all_feature_cols) + meta_col_names
 
     imp_path = CHECKPOINT_DIR / "feature_importances.json"

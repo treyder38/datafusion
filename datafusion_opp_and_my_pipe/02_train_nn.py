@@ -34,10 +34,10 @@ CHECKPOINT_DIR = Path("checkpoints_nn")
 BATCH_SIZE = 1024
 EPOCHS = 50
 LR = 5e-4
-WEIGHT_DECAY = 1e-3
+WEIGHT_DECAY = 5e-4
 PATIENCE = 10
 GRAD_CLIP = 1.0
-HIDDEN_DIM = 384
+HIDDEN_DIM = 512
 
 # DAE
 DAE_BOTTLENECK_DIM = 256
@@ -54,7 +54,7 @@ ASL_GAMMA_NEG = 4
 ASL_GAMMA_POS = 1
 ASL_CLIP = 0.05
 MIXUP_ALPHA = 0.2
-PLR_N_BINS = 24
+PLR_N_BINS = 48
 TOP_K_SWA = 5
 
 
@@ -300,9 +300,9 @@ class TabularNet(nn.Module):
             nn.Linear(input_dim, HIDDEN_DIM), nn.BatchNorm1d(HIDDEN_DIM), nn.SiLU(),
         )
         self.res_blocks = nn.ModuleList([
-            ResidualBlockBE(HIDDEN_DIM, k, dropout=0.4),
-            ResidualBlockBE(HIDDEN_DIM, k, dropout=0.4),
             ResidualBlockBE(HIDDEN_DIM, k, dropout=0.3),
+            ResidualBlockBE(HIDDEN_DIM, k, dropout=0.3),
+            ResidualBlockBE(HIDDEN_DIM, k, dropout=0.2),
         ])
         head_dim = HIDDEN_DIM // 2
         self.head_bn1 = nn.BatchNorm1d(HIDDEN_DIM)
@@ -459,7 +459,7 @@ def train_one_fold(fold_idx, tr_cat, tr_num, tr_y, val_cat, val_num, val_y,
     model.plr.set_bins(tr_num.numpy())
     criterion = AsymmetricLoss(ASL_GAMMA_NEG, ASL_GAMMA_POS, ASL_CLIP)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
 
     best_auc, patience_counter = 0, 0
     top_states = []
@@ -469,7 +469,7 @@ def train_one_fold(fold_idx, tr_cat, tr_num, tr_y, val_cat, val_num, val_y,
         train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
         val_preds, val_targets = evaluate_model(model, val_loader, device)
         macro_auc, _ = compute_macro_auc(val_targets, val_preds, target_cols)
-        scheduler.step(macro_auc)
+        scheduler.step()
 
         improved = ""
         if macro_auc > best_auc:

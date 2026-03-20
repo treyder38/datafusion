@@ -25,9 +25,7 @@ from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 from utils import (
     SEED,
     DATA_DIR,
-    N_FOLDS,
     compute_macro_auc,
-    detect_lgbm_device,
     to_ranks,
     verify_submission,
 )
@@ -38,13 +36,25 @@ N_META_FOLDS = 5
 def build_meta_features(*oof_arrays):
     """Build meta-feature matrix from N models.
 
-    For 5 models: 5*41 base + C(5,2)*41 diffs + C(5,2)*41 products = 1025 features.
+    For 5 models: 5*41 base + C(5,2)*41 diffs + C(5,2)*41 prods
+                  + 41 std + 41 max + 41 min + 5*41 ranks = extended features.
     """
     parts = list(oof_arrays)  # base predictions
     for a, b in combinations(oof_arrays, 2):
         parts.append(np.abs(a - b))
     for a, b in combinations(oof_arrays, 2):
         parts.append(a * b)
+
+    # Disagreement / aggregate features
+    stacked = np.stack(oof_arrays, axis=0)  # (n_models, n_samples, n_targets)
+    parts.append(stacked.std(axis=0).astype(np.float32))   # std across models
+    parts.append(stacked.max(axis=0).astype(np.float32))   # max across models
+    parts.append(stacked.min(axis=0).astype(np.float32))   # min across models
+
+    # Rank-based features per model
+    for arr in oof_arrays:
+        parts.append(to_ranks(arr).astype(np.float32))
+
     return np.hstack(parts).astype(np.float32)
 
 
@@ -56,7 +66,7 @@ def stack_ridge(X_train, y_train, X_test, target_cols):
     test_preds = np.zeros((n_test, n_targets), dtype=np.float32)
 
     kf = MultilabelStratifiedKFold(n_splits=N_META_FOLDS, shuffle=True, random_state=SEED)
-    alphas = [0.01, 0.1, 1.0, 10.0, 100.0]
+    alphas = np.logspace(-3, 3, 25).tolist()
     t0 = time.time()
 
     for t_idx in range(n_targets):
@@ -162,8 +172,10 @@ def main():
     print(f"Step 8: Stacking (Ridge + LGBM meta + combo, {n_models} models)")
     print("=" * 60)
 
-    device_params, device_name, _supports_cat = detect_lgbm_device()
-    print(f"  LightGBM device_type: {device_name}")
+    # Keep the meta-learner on CPU. This stage is small enough that CPU is fast,
+    # and GPU/OpenCL builds can fail on some drivers during program compilation.
+    device_params = {}
+    print("  LightGBM meta: CPU mode")
 
     # Load targets
     train_tgt = pl.read_parquet(f"{DATA_DIR}train_target.parquet")

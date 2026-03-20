@@ -309,20 +309,56 @@ def add_row_mean(df, num_cols):
     )
 
 
+def add_num_svd(train_df, test_df, num_cols, n_components=30):
+    """SVD of main numerical features. Fit on train only, transform both."""
+    train_arr = train_df.select(num_cols).to_numpy()
+    test_arr = test_df.select(num_cols).to_numpy()
+    train_arr = np.nan_to_num(train_arr, nan=0.0).astype(np.float32)
+    test_arr = np.nan_to_num(test_arr, nan=0.0).astype(np.float32)
+
+    mean = train_arr.mean(axis=0)
+    std = train_arr.std(axis=0)
+    std[std < 1e-8] = 1.0
+    train_arr = (train_arr - mean) / std
+    test_arr = (test_arr - mean) / std
+
+    svd = TruncatedSVD(n_components=n_components, random_state=SEED)
+    train_svd = svd.fit_transform(csr_matrix(train_arr))
+    test_svd = svd.transform(csr_matrix(test_arr))
+    var_explained = svd.explained_variance_ratio_.sum()
+    print(f"  Num SVD: {len(num_cols)} cols → {n_components} components, "
+          f"var explained: {var_explained:.3f}")
+
+    svd_cols = [f"num_svd_{i}" for i in range(n_components)]
+    train_df = train_df.hstack(pl.DataFrame(train_svd.astype(np.float32), schema=svd_cols))
+    test_df = test_df.hstack(pl.DataFrame(test_svd.astype(np.float32), schema=svd_cols))
+    del train_arr, test_arr, train_svd, test_svd; gc.collect()
+    return train_df, test_df, svd_cols
+
+
 def add_row_stats(df, num_cols, prefix):
-    """Add row-level std and skew for numerical columns."""
+    """Add row-level std, skew, kurtosis, min, max, range for numerical columns."""
     arr = df.select(num_cols).to_numpy()
     row_mean = np.nanmean(arr, axis=1, keepdims=True)
     diff = arr - row_mean
     m2 = np.nanmean(diff ** 2, axis=1)
     m3 = np.nanmean(diff ** 3, axis=1)
+    m4 = np.nanmean(diff ** 4, axis=1)
     row_std = np.sqrt(np.maximum(m2, 0)).astype(np.float32)
     with np.errstate(divide="ignore", invalid="ignore"):
         row_skew = np.where(m2 > 1e-16, m3 / (m2 ** 1.5 + 1e-16), 0).astype(np.float32)
-    del arr, diff, m2, m3; gc.collect()
+        row_kurt = np.where(m2 > 1e-16, m4 / (m2 ** 2 + 1e-16) - 3.0, 0).astype(np.float32)
+    row_min = np.nanmin(arr, axis=1).astype(np.float32)
+    row_max = np.nanmax(arr, axis=1).astype(np.float32)
+    row_range = (row_max - row_min).astype(np.float32)
+    del arr, diff, m2, m3, m4; gc.collect()
     return df.with_columns([
         pl.Series(f"{prefix}_row_std", row_std),
         pl.Series(f"{prefix}_row_skew", row_skew),
+        pl.Series(f"{prefix}_row_kurt", row_kurt),
+        pl.Series(f"{prefix}_row_min", row_min),
+        pl.Series(f"{prefix}_row_max", row_max),
+        pl.Series(f"{prefix}_row_range", row_range),
     ])
 
 
@@ -361,8 +397,8 @@ def add_target_encoding_oof(train_df, test_df, cat_cols, train_tgt, target_cols,
     """
     n_train = train_df.height
     y = train_tgt.select(target_cols).to_numpy().astype(np.float32)
-    global_means = y.mean(axis=0)
     n_targets = len(target_cols)
+    global_means_full = y.mean(axis=0)
 
     kf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     folds = list(kf.split(np.arange(n_train), y))
@@ -379,11 +415,12 @@ def add_target_encoding_oof(train_df, test_df, cat_cols, train_tgt, target_cols,
         # OOF encoding
         oof_te = np.full((n_train, n_targets), np.nan, dtype=np.float32)
         for tr_idx, val_idx in folds:
-            te_map = _compute_smoothed_te(train_cat[tr_idx], y[tr_idx], global_means, smoothing)
+            fold_global_means = y[tr_idx].mean(axis=0)
+            te_map = _compute_smoothed_te(train_cat[tr_idx], y[tr_idx], fold_global_means, smoothing)
             oof_te[val_idx] = _apply_te_map(train_cat[val_idx], te_map, n_targets)
 
         # Test encoding from full train
-        te_map_full = _compute_smoothed_te(train_cat, y, global_means, smoothing)
+        te_map_full = _compute_smoothed_te(train_cat, y, global_means_full, smoothing)
         test_te = _apply_te_map(test_cat, te_map_full, n_targets)
 
         # Mean across targets → 1 feature per cat
@@ -407,8 +444,8 @@ def add_per_target_te_oof(train_df, test_df, cat_cols, train_tgt, target_cols,
     """
     n_train = train_df.height
     y = train_tgt.select(target_cols).to_numpy().astype(np.float32)
-    global_means = y.mean(axis=0)
     n_targets = len(target_cols)
+    global_means_full = y.mean(axis=0)
 
     kf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     folds = list(kf.split(np.arange(n_train), y))
@@ -425,11 +462,12 @@ def add_per_target_te_oof(train_df, test_df, cat_cols, train_tgt, target_cols,
         # OOF
         oof_te = np.full((n_train, n_targets), np.nan, dtype=np.float32)
         for tr_idx, val_idx in folds:
-            te_map = _compute_smoothed_te(train_cat[tr_idx], y[tr_idx], global_means, smoothing)
+            fold_global_means = y[tr_idx].mean(axis=0)
+            te_map = _compute_smoothed_te(train_cat[tr_idx], y[tr_idx], fold_global_means, smoothing)
             oof_te[val_idx] = _apply_te_map(train_cat[val_idx], te_map, n_targets)
 
         # Test from full train
-        te_map_full = _compute_smoothed_te(train_cat, y, global_means, smoothing)
+        te_map_full = _compute_smoothed_te(train_cat, y, global_means_full, smoothing)
         test_te = _apply_te_map(test_cat, te_map_full, n_targets)
 
         for t_idx in range(n_targets):
@@ -556,7 +594,10 @@ def main():
     extra_num_for_stats = [c for c in train_extra.columns if c.startswith("num_feature")]
     train_extra = add_row_stats(train_extra, extra_num_for_stats, "extra")
     test_extra = add_row_stats(test_extra, extra_num_for_stats, "extra")
-    print(f"  + 4 row stats (main + extra std/skew)")
+    print(f"  + 12 row stats (main + extra std/skew/kurt/min/max/range)")
+
+    # SVD of main numerical features (fit on train only)
+    train_main, test_main, svd_cols = add_num_svd(train_main, test_main, num_cols_main, n_components=30)
 
     # Target encoding — mean across targets (1 per cat feature, OOF-safe)
     train_main, test_main, te_mean_cols = add_target_encoding_oof(
