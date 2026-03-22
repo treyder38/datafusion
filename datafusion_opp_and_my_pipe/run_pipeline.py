@@ -46,6 +46,13 @@ STEPS = [
         ),
     ),
     Step(
+        key="feat_sel",
+        label="Per-target feature selection",
+        script="01b_select_features.py",
+        outputs=("features/selected_features/summary.json",),
+        depends_on=("fe",),
+    ),
+    Step(
         key="nn",
         label="Neural network",
         script="02_train_nn.py",
@@ -57,7 +64,7 @@ STEPS = [
         label="LightGBM",
         script="03_train_lgbm.py",
         outputs=("checkpoints_lgbm/lgbm_predictions.npz",),
-        depends_on=("fe",),
+        depends_on=("fe", "feat_sel"),
     ),
     Step(
         key="pyboost",
@@ -71,7 +78,7 @@ STEPS = [
         label="CatBoost",
         script="05_train_catboost.py",
         outputs=("checkpoints_catboost/cb_predictions.npz",),
-        depends_on=("fe",),
+        depends_on=("fe", "feat_sel"),
     ),
     Step(
         key="lgbm_meta",

@@ -24,6 +24,7 @@ from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc
 
 FEATURES_DIR = Path("features")
+SELECTED_DIR = FEATURES_DIR / "selected_features"
 CHECKPOINT_DIR = Path("checkpoints_catboost")
 MODELS_DIR = CHECKPOINT_DIR / "models"
 
@@ -109,6 +110,23 @@ def main():
     print(f"  X_train: {X_train.shape}, X_test: {X_test.shape}")
     print(f"  Features: {len(cat_feature_names)} cat, {len(feature_cols) - len(cat_feature_names)} num")
 
+    # Load per-target feature selections (if available from 01b_select_features.py)
+    per_target_feats = {}
+    if SELECTED_DIR.exists():
+        for target in target_cols:
+            fpath = SELECTED_DIR / f"{target}.json"
+            if fpath.exists():
+                with open(fpath) as f:
+                    per_target_feats[target] = [c for c in json.load(f) if c in feature_cols]
+        if len(per_target_feats) == len(target_cols):
+            n_feats = [len(v) for v in per_target_feats.values()]
+            print(f"  Per-target selection: {min(n_feats)}-{max(n_feats)} features/target")
+        else:
+            per_target_feats = {}
+            print(f"  Per-target selection: not available, using all {len(feature_cols)} features")
+    else:
+        print(f"  Per-target selection: not available, using all {len(feature_cols)} features")
+
     # 2. Check cache
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -141,13 +159,28 @@ def main():
 
             params = dict(cb_params)
             params["random_seed"] = SEED + fold_idx
+            params["auto_class_weights"] = "Balanced"
             if task_type == "GPU":
                 params["task_type"] = "GPU"
                 params["devices"] = devices
 
-            tr_pool = Pool(X_train.iloc[tr_idx], y[tr_idx], cat_features=cat_feature_names)
-            va_pool = Pool(X_train.iloc[val_idx], y[val_idx], cat_features=cat_feature_names)
-            te_pool = Pool(X_test, cat_features=cat_feature_names)
+            # Per-target feature selection
+            if col in per_target_feats:
+                sel_cols = per_target_feats[col]
+                sel_cats = [c for c in cat_feature_names if c in sel_cols]
+                X_tr_t = X_train[sel_cols].iloc[tr_idx]
+                X_va_t = X_train[sel_cols].iloc[val_idx]
+                X_te_t = X_test[sel_cols]
+            else:
+                sel_cols = feature_cols
+                sel_cats = cat_feature_names
+                X_tr_t = X_train.iloc[tr_idx]
+                X_va_t = X_train.iloc[val_idx]
+                X_te_t = X_test
+
+            tr_pool = Pool(X_tr_t, y[tr_idx], cat_features=sel_cats)
+            va_pool = Pool(X_va_t, y[val_idx], cat_features=sel_cats)
+            te_pool = Pool(X_te_t, cat_features=sel_cats)
 
             cb = CatBoostClassifier(**params)
             cb.fit(tr_pool, eval_set=va_pool, verbose=0)
@@ -159,8 +192,14 @@ def main():
             model_path = MODELS_DIR / f"{col}_fold{fold_idx}.cbm"
             cb.save_model(str(model_path))
 
-            # Accumulate feature importances (PredictionValuesChange)
-            importance_sum[:, i] += cb.get_feature_importance()
+            # Accumulate feature importances (scatter back to full array)
+            imp = cb.get_feature_importance()
+            if col in per_target_feats:
+                for j, sc in enumerate(sel_cols):
+                    if sc in feature_cols:
+                        importance_sum[feature_cols.index(sc), i] += imp[j]
+            else:
+                importance_sum[:, i] += imp
 
             del cb, tr_pool, va_pool, te_pool; gc.collect()
             if (i + 1) % 10 == 0 or i == n_targets - 1:

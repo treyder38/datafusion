@@ -26,6 +26,7 @@ from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc
 
 FEATURES_DIR = Path("features")
+SELECTED_DIR = FEATURES_DIR / "selected_features"
 CHECKPOINT_DIR = Path("checkpoints_lgbm")
 MODELS_DIR = CHECKPOINT_DIR / "models"
 
@@ -61,11 +62,43 @@ LGBM_PARAMS = dict(
 EARLY_STOPPING_ROUNDS = 100
 
 
+def _load_per_target_features(target_cols, all_feature_cols):
+    """Load per-target feature selections if available.
+
+    Returns dict {target_name: list_of_col_indices} or None if not available.
+    """
+    if not SELECTED_DIR.exists():
+        return None
+    per_target = {}
+    col_to_idx = {c: i for i, c in enumerate(all_feature_cols)}
+    for target in target_cols:
+        fpath = SELECTED_DIR / f"{target}.json"
+        if not fpath.exists():
+            return None  # incomplete — fall back to all features
+        with open(fpath) as f:
+            selected = json.load(f)
+        per_target[target] = [col_to_idx[c] for c in selected if c in col_to_idx]
+    return per_target
+
+
 def _train_one_target(target_idx, target_name, fold_idx, threads,
                       cat_indices, supports_cat, device_params,
-                      X_tr, y_tr, X_val, y_val, X_test):
+                      X_tr, y_tr, X_val, y_val, X_test,
+                      feat_indices=None):
     """Train a single target — runs in a thread (GIL released by LightGBM C++)."""
-    params = {**LGBM_PARAMS, "n_jobs": threads, **device_params}
+    # Per-target feature selection
+    if feat_indices is not None:
+        X_tr = X_tr[:, feat_indices]
+        X_val = X_val[:, feat_indices]
+        X_test = X_test[:, feat_indices]
+        cat_idx_set = set(cat_indices) if cat_indices else set()
+        cat_indices = [i for i, fi in enumerate(feat_indices) if fi in cat_idx_set]
+
+    y_t = y_tr[:, target_idx]
+    n_neg = (y_t == 0).sum()
+    n_pos = (y_t == 1).sum()
+    spw = n_neg / max(n_pos, 1)
+    params = {**LGBM_PARAMS, "n_jobs": threads, "scale_pos_weight": spw, **device_params}
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
@@ -120,6 +153,14 @@ def main():
     print(f"  X_train: {X_train.shape}, X_test: {X_test.shape}")
     print(f"  Features: {len(cat_feature_names)} cat, {len(feature_cols) - len(cat_feature_names)} num")
 
+    # Load per-target feature selections (if available from 01b_select_features.py)
+    per_target_feats = _load_per_target_features(target_cols, feature_cols)
+    if per_target_feats:
+        n_feats = [len(v) for v in per_target_feats.values()]
+        print(f"  Per-target selection: {min(n_feats)}-{max(n_feats)} features/target")
+    else:
+        print(f"  Per-target selection: not available, using all {len(feature_cols)} features")
+
     # 2. Check cache
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -153,21 +194,29 @@ def main():
         # Parallel training across targets using threads
         # LightGBM releases GIL → threads are truly parallel, zero copy overhead
         with ThreadPoolExecutor(max_workers=PARALLEL_TARGETS) as executor:
-            futures = {
-                executor.submit(
+            futures = {}
+            for i, col in enumerate(target_cols):
+                fi = per_target_feats.get(col) if per_target_feats else None
+                futures[executor.submit(
                     _train_one_target, i, col, fold_idx, THREADS_PER_MODEL,
                     cat_indices, supports_cat, device_params,
-                    X_tr, y_tr, X_val, y_val, X_test
-                ): i
-                for i, col in enumerate(target_cols)
-            }
+                    X_tr, y_tr, X_val, y_val, X_test,
+                    feat_indices=fi,
+                )] = (i, fi)
+
             done_count = 0
             for future in as_completed(futures):
-                i = futures[future]
+                i, fi = futures[future]
                 val_p, test_p, imp = future.result()
                 oof_preds[val_idx, i] = val_p
                 fold_test_preds[:, i] = test_p
-                importance_sum[:, i] += imp
+                # Scatter per-target importance back to full feature array
+                if fi is not None:
+                    for j, feat_idx in enumerate(fi):
+                        if j < len(imp):
+                            importance_sum[feat_idx, i] += imp[j]
+                else:
+                    importance_sum[:, i] += imp
                 done_count += 1
                 if done_count % 10 == 0 or done_count == n_targets:
                     print(f"    {done_count}/{n_targets} targets done", flush=True)

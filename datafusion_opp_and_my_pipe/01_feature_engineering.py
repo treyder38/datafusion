@@ -24,7 +24,7 @@ from utils import SEED, DATA_DIR, N_FOLDS
 
 FEATURES_DIR = Path("features")
 NULL_PCA_COMPONENTS = 20
-INDIVIDUAL_NULL_THRESHOLD = 0.05
+INDIVIDUAL_NULL_THRESHOLD = 0.02
 TE_SMOOTHING = 20  # smoothing factor for target encoding
 
 # ── Feature Engineering Config ────────────────────────────────────
@@ -99,6 +99,34 @@ DUPLICATE_CATS = [
     "cat_feature_50",
     "cat_feature_63",
 ]
+
+# Features with high train/test distribution shift (EDA safe_drop)
+SHIFT_DROP = [
+    "num_feature_34",
+    "num_feature_43",
+    "num_feature_54",
+    "num_feature_64",
+    "num_feature_74",
+    "num_feature_118",
+]
+
+# EDA-based drop: main features never in top-200 for any target (CatBoost importance).
+# Excludes features used in engineering configs (NULL_GROUPS, RATIO_FEATURES, etc.)
+# and features already in SHIFT_DROP.
+EDA_DROP_MAIN = [
+    "cat_feature_34",
+    "num_feature_3", "num_feature_9", "num_feature_12", "num_feature_14",
+    "num_feature_20", "num_feature_22", "num_feature_28", "num_feature_32",
+    "num_feature_37", "num_feature_44", "num_feature_45", "num_feature_47",
+    "num_feature_49", "num_feature_55", "num_feature_70", "num_feature_78",
+    "num_feature_80", "num_feature_82", "num_feature_84", "num_feature_89",
+    "num_feature_91", "num_feature_92", "num_feature_93", "num_feature_101",
+    "num_feature_102", "num_feature_106", "num_feature_110", "num_feature_112",
+    "num_feature_113", "num_feature_115", "num_feature_122", "num_feature_123",
+]
+
+# EDA-based drop: 981 extra features never in top-200 for any target
+EDA_EXTRA_DROP_FILE = Path("eda_extra_drop.json")
 
 
 # ── Helper functions ──────────────────────────────────────────────
@@ -485,6 +513,30 @@ def add_per_target_te_oof(train_df, test_df, cat_cols, train_tgt, target_cols,
     return train_df, test_df, all_names
 
 
+def eda_feature_selection(train_main, test_main, train_extra, test_extra):
+    """Drop features that never appear in top-200 importance for any target (EDA)."""
+    # Drop main features
+    main_drop = [c for c in EDA_DROP_MAIN if c in train_main.columns]
+    if main_drop:
+        train_main = train_main.drop(main_drop)
+        test_main = test_main.drop(main_drop)
+        print(f"  EDA drop: {len(main_drop)} main features")
+
+    # Drop extra features from JSON list
+    if EDA_EXTRA_DROP_FILE.exists():
+        with open(EDA_EXTRA_DROP_FILE) as f:
+            extra_drop_list = json.load(f)
+        extra_drop = [c for c in extra_drop_list if c in train_extra.columns]
+        if extra_drop:
+            train_extra = train_extra.drop(extra_drop)
+            test_extra = test_extra.drop(extra_drop)
+            print(f"  EDA drop: {len(extra_drop)} extra features")
+    else:
+        print(f"  Warning: {EDA_EXTRA_DROP_FILE} not found, skipping extra drop")
+
+    return train_main, test_main, train_extra, test_extra
+
+
 def remove_duplicate_cats(train_df, test_df, dup_cols):
     """Remove duplicate categorical features."""
     existing = [c for c in dup_cols if c in train_df.columns]
@@ -505,7 +557,7 @@ def main():
     print("=" * 60)
 
     # 1. Load raw data
-    print("\n[1/8] Loading raw data...")
+    print("\n[1/9] Loading raw data...")
     train_main = pl.read_parquet(f"{DATA_DIR}train_main_features.parquet")
     test_main = pl.read_parquet(f"{DATA_DIR}test_main_features.parquet")
     train_extra_raw = pl.read_parquet(f"{DATA_DIR}train_extra_features.parquet")
@@ -518,26 +570,38 @@ def main():
     target_cols = [c for c in train_tgt.columns if c.startswith("target_")]
 
     # 2. Null pattern PCA (on raw extra, before filtering)
-    print("\n[2/8] Null Pattern PCA...")
+    print("\n[2/9] Null Pattern PCA...")
     train_null_pca, test_null_pca = null_pattern_pca(
         train_extra_raw, test_extra_raw, NULL_PCA_COMPONENTS
     )
 
     # 3. Filter + dedup extra
-    print("\n[3/8] Filter + dedup extra features...")
+    print("\n[3/9] Filter + dedup extra features...")
     train_extra, test_extra = filter_extra_features(train_extra_raw, test_extra_raw)
     del train_extra_raw, test_extra_raw; gc.collect()
     train_extra, test_extra = deduplicate_extra_features(train_extra, test_extra)
 
-    # 4. Remove duplicate cats + cast
-    print("\n[4/8] Prepare categoricals...")
+    # 4. EDA-based feature selection (drop features never in top-200)
+    print("\n[4/9] EDA feature selection...")
+    train_main, test_main, train_extra, test_extra = eda_feature_selection(
+        train_main, test_main, train_extra, test_extra
+    )
+
+    # 5. Remove duplicate cats + shift-dangerous features + cast
+    print("\n[5/9] Prepare categoricals...")
     train_main, test_main = remove_duplicate_cats(train_main, test_main, DUPLICATE_CATS)
+    shift_existing = [c for c in SHIFT_DROP if c in train_main.columns]
+    if shift_existing:
+        train_main = train_main.drop(shift_existing)
+        test_main = test_main.drop(shift_existing)
+        print(f"  Dropped {len(shift_existing)} high-shift features")
     cat_cols = sorted([c for c in train_main.columns if c.startswith("cat_feature")])
+    num_cols_main = sorted([c for c in train_main.columns if c.startswith("num_feature")])
     train_main = train_main.with_columns(pl.col(cat_cols).cast(pl.Int32))
     test_main = test_main.with_columns(pl.col(cat_cols).cast(pl.Int32))
 
-    # 5. Feature engineering
-    print("\n[5/8] Engineering features...")
+    # 6. Feature engineering
+    print("\n[6/9] Engineering features...")
 
     # Null indicators (groups)
     train_main = add_null_indicators(train_main, NULL_GROUPS_MAIN)
@@ -606,16 +670,17 @@ def main():
     print(f"  + {len(te_mean_cols)} target encoding (mean) features")
 
     # Per-target target encoding for top interaction cats (OOF-safe)
-    TE_TOP_CATS = [c for c in ["cat_feature_66", "cat_feature_46", "cat_feature_39",
-                                "cat_feature_48", "cat_feature_9", "cat_feature_52"]
+    TE_TOP_CATS = [c for c in ["cat_feature_66", "cat_feature_40", "cat_feature_39",
+                                "cat_feature_48", "cat_feature_9", "cat_feature_52",
+                                "cat_feature_1", "cat_feature_56"]
                    if c in cat_cols]
     train_main, test_main, te_pt_cols = add_per_target_te_oof(
         train_main, test_main, TE_TOP_CATS, train_tgt, target_cols
     )
     print(f"  + {len(te_pt_cols)} per-target TE features ({len(TE_TOP_CATS)} cats × {len(target_cols)} targets)")
 
-    # 6. Join main + extra + null PCA
-    print("\n[6/9] Joining features...")
+    # 7. Join main + extra + null PCA
+    print("\n[7/9] Joining features...")
     train_feat = train_main.join(train_extra, on="customer_id")
     test_feat = test_main.join(test_extra, on="customer_id")
     del train_main, train_extra, test_main, test_extra; gc.collect()
@@ -632,14 +697,14 @@ def main():
     print(f"  Total: {len(feature_cols)} features "
           f"({len(cat_feature_names)} cat, {len(num_feature_names)} num)")
 
-    # 7. Save targets
-    print("\n[7/9] Saving targets...")
+    # 8. Save targets
+    print("\n[8/9] Saving targets...")
     FEATURES_DIR.mkdir(exist_ok=True)
     targets = train_tgt.select(["customer_id"] + target_cols)
     targets.write_parquet(FEATURES_DIR / "targets.parquet")
 
-    # 8. Save features + metadata
-    print("\n[8/9] Saving features...")
+    # 9. Save features + metadata
+    print("\n[9/9] Saving features...")
     train_feat.write_parquet(FEATURES_DIR / "train_features.parquet")
     test_feat.write_parquet(FEATURES_DIR / "test_features.parquet")
 

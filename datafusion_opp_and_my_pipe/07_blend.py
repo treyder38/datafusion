@@ -107,13 +107,13 @@ def main():
     print(f"  LGBM_meta: OOF {lgbm_meta_auc:.5f}")
 
     # Rank per-target optimization
-    print(f"\n[2/3] Optimizing per-target weights ({n_models} models, step=0.05)...")
+    print(f"\n[2/3] Optimizing per-target weights ({n_models} models, step=0.10)...")
     oof_ranks = [to_ranks(oof_nn), to_ranks(oof_lgbm), to_ranks(oof_pb),
                  to_ranks(oof_cb), to_ranks(oof_lgbm_meta)]
     test_ranks = [to_ranks(test_nn), to_ranks(test_lgbm), to_ranks(test_pb),
                   to_ranks(test_cb), to_ranks(test_lgbm_meta)]
 
-    weights = optimize_per_target(oof_ranks, y, target_cols, n_models, step=0.05)
+    weights = optimize_per_target(oof_ranks, y, target_cols, n_models, step=0.10)
 
     # Build blended predictions
     n_targets = len(target_cols)

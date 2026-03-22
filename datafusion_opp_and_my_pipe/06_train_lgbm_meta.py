@@ -204,7 +204,11 @@ def main():
                     X_val_full[:, c] = np.nan
                     X_test_full[:, c] = np.nan
 
-                params = {**LGBM_PARAMS, **device_params}
+                y_t = y_tr[:, i]
+                n_neg = (y_t == 0).sum()
+                n_pos = (y_t == 1).sum()
+                spw = n_neg / max(n_pos, 1)
+                params = {**LGBM_PARAMS, "scale_pos_weight": spw, **device_params}
                 model = lgb.LGBMClassifier(**params)
                 model.fit(
                     X_tr_full, y_tr[:, i],
