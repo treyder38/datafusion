@@ -20,24 +20,22 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import polars as pl
-from sklearn.model_selection import train_test_split
-
 from utils import SEED
 
 FEATURES_DIR = Path("features")
 SELECTED_DIR = FEATURES_DIR / "selected_features"
 
-TOP_K = 300
-SUBSAMPLE_SIZE = 120_000
+TOP_K = 350
+SUBSAMPLE_SIZE = 300_000
+N_SELECTION_FOLDS = 3  # average importance across folds for stability
 
-# Quick LGBM for importance estimation — not for prediction quality
 LGBM_PARAMS = dict(
     objective="binary",
     metric="auc",
-    learning_rate=0.1,
-    num_leaves=32,
-    max_depth=5,
-    n_estimators=150,
+    learning_rate=0.05,
+    num_leaves=64,
+    max_depth=-1,
+    n_estimators=500,
     subsample=0.8,
     colsample_bytree=0.8,
     min_child_samples=20,
@@ -63,29 +61,31 @@ def subsample_balanced(y, size=SUBSAMPLE_SIZE):
 
 
 def select_features_for_target(X, y, feature_names):
-    """Train quick LGBM and return top-K features by gain importance."""
-    tr_idx, val_idx = train_test_split(
-        np.arange(len(y)), test_size=0.2, random_state=SEED, stratify=y
-    )
+    """Train N-fold LGBM and return top-K features by averaged gain importance."""
+    from sklearn.model_selection import StratifiedKFold
 
-    n_neg = (y[tr_idx] == 0).sum()
-    n_pos = (y[tr_idx] == 1).sum()
+    n_neg = (y == 0).sum()
+    n_pos = (y == 1).sum()
     spw = n_neg / max(n_pos, 1)
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        model = lgb.LGBMClassifier(**LGBM_PARAMS, scale_pos_weight=spw)
-        model.fit(
-            X[tr_idx], y[tr_idx],
-            eval_set=[(X[val_idx], y[val_idx])],
-            callbacks=[
-                lgb.early_stopping(20, verbose=False),
-                lgb.log_evaluation(0),
-            ],
-        )
+    importance_sum = np.zeros(X.shape[1], dtype=np.float64)
+    kf = StratifiedKFold(n_splits=N_SELECTION_FOLDS, shuffle=True, random_state=SEED)
 
-    importances = model.booster_.feature_importance(importance_type="gain")
-    top_indices = np.argsort(importances)[::-1][:TOP_K]
+    for tr_idx, val_idx in kf.split(X, y):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            model = lgb.LGBMClassifier(**LGBM_PARAMS, scale_pos_weight=spw)
+            model.fit(
+                X[tr_idx], y[tr_idx],
+                eval_set=[(X[val_idx], y[val_idx])],
+                callbacks=[
+                    lgb.early_stopping(50, verbose=False),
+                    lgb.log_evaluation(0),
+                ],
+            )
+        importance_sum += model.booster_.feature_importance(importance_type="gain")
+
+    top_indices = np.argsort(importance_sum)[::-1][:TOP_K]
     return [feature_names[i] for i in top_indices]
 
 

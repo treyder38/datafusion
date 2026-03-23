@@ -59,35 +59,40 @@ def build_meta_features(*oof_arrays):
 
 
 def stack_ridge(X_train, y_train, X_test, target_cols):
-    """Ridge per-target stacking with alpha selection.
-
-    Uses RidgeCV with efficient leave-one-out / GCV instead of
-    brute-force alpha × folds loop (41 × 25 × 5 = 5125 fits → 41 fits).
-    """
-    from sklearn.linear_model import RidgeCV
-
+    """Ridge per-target stacking with alpha selection via OOF AUC."""
     n_train, n_targets = y_train.shape
     n_test = X_test.shape[0]
     oof_preds = np.zeros((n_train, n_targets), dtype=np.float32)
     test_preds = np.zeros((n_test, n_targets), dtype=np.float32)
 
     kf = MultilabelStratifiedKFold(n_splits=N_META_FOLDS, shuffle=True, random_state=SEED)
-    alphas = np.logspace(-3, 3, 25)
+    alphas = [0.01, 0.1, 1.0, 10.0, 100.0]
     t0 = time.time()
 
     for t_idx in range(n_targets):
         y_t = y_train[:, t_idx]
+        best_alpha, best_oof_auc, best_oof, best_test = 1.0, 0, None, None
 
-        fold_oof = np.zeros(n_train, dtype=np.float32)
-        fold_test = np.zeros(n_test, dtype=np.float32)
-        for tr_idx, val_idx in kf.split(np.arange(n_train), y_train):
-            model = RidgeCV(alphas=alphas, scoring="roc_auc")
-            model.fit(X_train[tr_idx], y_t[tr_idx])
-            fold_oof[val_idx] = model.predict(X_train[val_idx])
-            fold_test += model.predict(X_test) / N_META_FOLDS
+        for alpha in alphas:
+            fold_oof = np.zeros(n_train, dtype=np.float32)
+            fold_test = np.zeros(n_test, dtype=np.float32)
+            for tr_idx, val_idx in kf.split(np.arange(n_train), y_train):
+                model = Ridge(alpha=alpha, random_state=SEED)
+                model.fit(X_train[tr_idx], y_t[tr_idx])
+                fold_oof[val_idx] = model.predict(X_train[val_idx])
+                fold_test += model.predict(X_test) / N_META_FOLDS
 
-        oof_preds[:, t_idx] = fold_oof
-        test_preds[:, t_idx] = fold_test
+            if y_t.sum() >= 2 and (len(y_t) - y_t.sum()) >= 2:
+                auc = roc_auc_score(y_t, fold_oof)
+                if auc > best_oof_auc:
+                    best_oof_auc = auc
+                    best_alpha = alpha
+                    best_oof = fold_oof.copy()
+                    best_test = fold_test.copy()
+
+        if best_oof is not None:
+            oof_preds[:, t_idx] = best_oof
+            test_preds[:, t_idx] = best_test
 
         if (t_idx + 1) % 10 == 0 or t_idx == n_targets - 1:
             elapsed = time.time() - t0
