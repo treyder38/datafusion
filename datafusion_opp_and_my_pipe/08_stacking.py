@@ -59,14 +59,14 @@ def build_meta_features(*oof_arrays):
 
 
 def stack_ridge(X_train, y_train, X_test, target_cols):
-    """Ridge per-target stacking with alpha selection."""
+    """Ridge per-target stacking with alpha selection via OOF AUC."""
     n_train, n_targets = y_train.shape
     n_test = X_test.shape[0]
     oof_preds = np.zeros((n_train, n_targets), dtype=np.float32)
     test_preds = np.zeros((n_test, n_targets), dtype=np.float32)
 
     kf = MultilabelStratifiedKFold(n_splits=N_META_FOLDS, shuffle=True, random_state=SEED)
-    alphas = np.logspace(-3, 3, 25).tolist()
+    alphas = [0.01, 0.1, 1.0, 10.0, 100.0]
     t0 = time.time()
 
     for t_idx in range(n_targets):
