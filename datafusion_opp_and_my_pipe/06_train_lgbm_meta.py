@@ -31,26 +31,23 @@ MODELS_DIR = CHECKPOINT_DIR / "models"
 
 N_CPUS = os.cpu_count() or 8
 
-# Same Optuna-tuned params as base LGBM
 LGBM_PARAMS = dict(
     objective="binary",
     metric="auc",
-    learning_rate=0.050216,
-    num_leaves=34,
-    max_depth=10,
-    min_child_samples=102,
-    n_estimators=500,
-    subsample=0.521715,
-    colsample_bytree=0.205092,
-    reg_alpha=8.146025,
-    reg_lambda=7.761833,
-    min_split_gain=0.424512,
-    subsample_freq=2,
+    learning_rate=0.05,
+    num_leaves=31,
+    max_depth=-1,
+    min_child_samples=20,
+    n_estimators=2000,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_alpha=0.0,
+    reg_lambda=0.0,
+    subsample_freq=1,
     random_state=SEED,
     verbose=-1,
     force_col_wise=True,
-    max_bin=127,
-    feature_pre_filter=True,
+    max_bin=255,
     n_jobs=-1,
 )
 EARLY_STOPPING_ROUNDS = 100
