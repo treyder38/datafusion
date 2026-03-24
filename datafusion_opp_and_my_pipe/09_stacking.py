@@ -1,7 +1,7 @@
-"""Step 8: Stacking — Ridge + LGBM meta-learner + combo (5 models).
+"""Step 9: Stacking — LGBM meta-learner + combo (6 models).
 
-Meta-features: 5x41 base + C(5,2)x41 pairwise |diffs| + C(5,2)x41 pairwise prods = 1025.
-Ridge and LGBM meta-learners trained with 5-fold OOF.
+Meta-features: 6x41 base + C(6,2)x41 pairwise |diffs| + C(6,2)x41 pairwise prods + aggregates.
+LGBM meta-learner trained with 4-fold OOF.
 Final combo: alpha * rank(meta) + (1-alpha) * rank(blend).
 
 Output: submissions/stacking.parquet
@@ -18,7 +18,6 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 from scipy.stats import rankdata
-from sklearn.linear_model import Ridge
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
@@ -30,7 +29,7 @@ from utils import (
     verify_submission,
 )
 
-N_META_FOLDS = 5
+N_META_FOLDS = 4
 
 
 def build_meta_features(*oof_arrays):
@@ -56,49 +55,6 @@ def build_meta_features(*oof_arrays):
         parts.append(to_ranks(arr).astype(np.float32))
 
     return np.hstack(parts).astype(np.float32)
-
-
-def stack_ridge(X_train, y_train, X_test, target_cols):
-    """Ridge per-target stacking with alpha selection via OOF AUC."""
-    n_train, n_targets = y_train.shape
-    n_test = X_test.shape[0]
-    oof_preds = np.zeros((n_train, n_targets), dtype=np.float32)
-    test_preds = np.zeros((n_test, n_targets), dtype=np.float32)
-
-    kf = MultilabelStratifiedKFold(n_splits=N_META_FOLDS, shuffle=True, random_state=SEED)
-    alphas = [0.01, 0.1, 1.0, 10.0, 100.0]
-    t0 = time.time()
-
-    for t_idx in range(n_targets):
-        y_t = y_train[:, t_idx]
-        best_alpha, best_oof_auc, best_oof, best_test = 1.0, 0, None, None
-
-        for alpha in alphas:
-            fold_oof = np.zeros(n_train, dtype=np.float32)
-            fold_test = np.zeros(n_test, dtype=np.float32)
-            for tr_idx, val_idx in kf.split(np.arange(n_train), y_train):
-                model = Ridge(alpha=alpha, random_state=SEED)
-                model.fit(X_train[tr_idx], y_t[tr_idx])
-                fold_oof[val_idx] = model.predict(X_train[val_idx])
-                fold_test += model.predict(X_test) / N_META_FOLDS
-
-            if y_t.sum() >= 2 and (len(y_t) - y_t.sum()) >= 2:
-                auc = roc_auc_score(y_t, fold_oof)
-                if auc > best_oof_auc:
-                    best_oof_auc = auc
-                    best_alpha = alpha
-                    best_oof = fold_oof.copy()
-                    best_test = fold_test.copy()
-
-        if best_oof is not None:
-            oof_preds[:, t_idx] = best_oof
-            test_preds[:, t_idx] = best_test
-
-        if (t_idx + 1) % 10 == 0 or t_idx == n_targets - 1:
-            elapsed = time.time() - t0
-            print(f"    Ridge: {t_idx+1}/{n_targets} targets ({elapsed:.1f}s)", flush=True)
-
-    return oof_preds, test_preds
 
 
 def stack_lgbm_meta(X_train, y_train, X_test, target_cols, device_params):
@@ -134,42 +90,52 @@ def stack_lgbm_meta(X_train, y_train, X_test, target_cols, device_params):
     return oof_preds, test_preds
 
 
+def _gen_weight_combos(n_models, step):
+    """Generate all weight combinations that sum to ~1.0."""
+    grid = np.arange(0, 1.01, step)
+    def _recurse(depth, remaining):
+        if depth == n_models - 1:
+            if remaining >= -0.001:
+                yield (remaining,)
+            return
+        for w in grid:
+            if w > remaining + 0.001:
+                break
+            for rest in _recurse(depth + 1, remaining - w):
+                yield (w,) + rest
+    return _recurse(0, 1.0)
+
+
 def optimize_rank_blend(oof_list, y, target_cols, n_models, step=0.10):
     """Per-target weight optimization for N-model rank blend."""
     oof_ranks = [to_ranks(arr) for arr in oof_list]
     n_targets = len(target_cols)
     default_w = [1.0 / n_models] * n_models
     weights = np.zeros((n_targets, n_models))
+    combos = list(_gen_weight_combos(n_models, step))
     for i in range(n_targets):
         y_t = y[:, i]
         if y_t.sum() < 2 or (len(y_t) - y_t.sum()) < 2:
             weights[i] = default_w
             continue
+        ranks_i = np.column_stack([oof_ranks[m][:, i] for m in range(n_models)])
         best_auc, best_w = 0.0, default_w[:]
-        for w0 in np.arange(0, 1.01, step):
-            for w1 in np.arange(0, 1.01 - w0, step):
-                for w2 in np.arange(0, 1.01 - w0 - w1, step):
-                    for w3 in np.arange(0, 1.01 - w0 - w1 - w2, step):
-                        w4 = 1.0 - w0 - w1 - w2 - w3
-                        if w4 < -0.001:
-                            continue
-                        blended = (w0*oof_ranks[0][:, i] + w1*oof_ranks[1][:, i]
-                                   + w2*oof_ranks[2][:, i] + w3*oof_ranks[3][:, i]
-                                   + w4*oof_ranks[4][:, i])
-                        auc = roc_auc_score(y_t, blended)
-                        if auc > best_auc:
-                            best_auc = auc
-                            best_w = [w0, w1, w2, w3, w4]
+        for combo in combos:
+            blended = ranks_i @ np.array(combo)
+            auc = roc_auc_score(y_t, blended)
+            if auc > best_auc:
+                best_auc = auc
+                best_w = list(combo)
         weights[i] = best_w
     return weights, oof_ranks
 
 
 def main():
     t0 = time.time()
-    model_names = ["NN", "LGBM", "PyBoost", "CatBoost", "LGBM_meta"]
+    model_names = ["NN", "LGBM", "XGBoost", "PyBoost", "CatBoost", "LGBM_meta"]
     n_models = len(model_names)
     print("=" * 60)
-    print(f"Step 8: Stacking (Ridge + LGBM meta + combo, {n_models} models)")
+    print(f"Step 9: Stacking (LGBM meta + combo, {n_models} models)")
     print("=" * 60)
 
     # Keep the meta-learner on CPU. This stage is small enough that CPU is fast,
@@ -184,12 +150,14 @@ def main():
     n_train, n_targets = y.shape
 
     # Load predictions
-    print("\n[1/5] Loading predictions...")
+    print("\n[1/4] Loading predictions...")
     d = np.load("blend_artifacts/blend_data.npz")
     oof_nn = d["oof_nn"].astype(np.float32)
     test_nn = d["test_nn"].astype(np.float32)
     oof_lgbm = d["oof_lgbm"].astype(np.float32)
     test_lgbm = d["test_lgbm"].astype(np.float32)
+    oof_xgb = d["oof_xgb"].astype(np.float32)
+    test_xgb = d["test_xgb"].astype(np.float32)
     oof_pb = d["oof_pb"].astype(np.float32)
     test_pb = d["test_pb"].astype(np.float32)
     oof_cb = d["oof_cb"].astype(np.float32)
@@ -198,18 +166,18 @@ def main():
     test_lgbm_meta = d["test_lgbm_meta"].astype(np.float32)
 
     n_test = test_nn.shape[0]
-    for name, oof in [("NN", oof_nn), ("LGBM", oof_lgbm), ("PyBoost", oof_pb),
-                      ("CatBoost", oof_cb), ("LGBM_meta", oof_lgbm_meta)]:
+    for name, oof in [("NN", oof_nn), ("LGBM", oof_lgbm), ("XGBoost", oof_xgb),
+                      ("PyBoost", oof_pb), ("CatBoost", oof_cb), ("LGBM_meta", oof_lgbm_meta)]:
         auc, _ = compute_macro_auc(y, oof, target_cols)
         print(f"  {name}: {auc:.4f}")
 
     # Rank blend baseline
     print(f"\n  Computing rank blend baseline ({n_models} models)...")
     blend_weights, oof_ranks = optimize_rank_blend(
-        [oof_nn, oof_lgbm, oof_pb, oof_cb, oof_lgbm_meta], y, target_cols, n_models
+        [oof_nn, oof_lgbm, oof_xgb, oof_pb, oof_cb, oof_lgbm_meta], y, target_cols, n_models
     )
-    test_ranks = [to_ranks(test_nn), to_ranks(test_lgbm), to_ranks(test_pb),
-                  to_ranks(test_cb), to_ranks(test_lgbm_meta)]
+    test_ranks = [to_ranks(test_nn), to_ranks(test_lgbm), to_ranks(test_xgb),
+                  to_ranks(test_pb), to_ranks(test_cb), to_ranks(test_lgbm_meta)]
 
     baseline_oof = np.zeros_like(oof_nn)
     baseline_test = np.zeros_like(test_nn)
@@ -221,20 +189,14 @@ def main():
     baseline_auc, _ = compute_macro_auc(y, baseline_oof, target_cols)
     print(f"  Rank blend baseline: {baseline_auc:.4f}")
 
-    # Build meta-features (5 models -> 1025 features)
-    print("\n[2/5] Building meta-features...")
-    X_meta_train = build_meta_features(oof_nn, oof_lgbm, oof_pb, oof_cb, oof_lgbm_meta)
-    X_meta_test = build_meta_features(test_nn, test_lgbm, test_pb, test_cb, test_lgbm_meta)
+    # Build meta-features (5 models)
+    print("\n[2/4] Building meta-features...")
+    X_meta_train = build_meta_features(oof_nn, oof_lgbm, oof_xgb, oof_pb, oof_cb, oof_lgbm_meta)
+    X_meta_test = build_meta_features(test_nn, test_lgbm, test_xgb, test_pb, test_cb, test_lgbm_meta)
     print(f"  Meta-features: {X_meta_train.shape[1]}")
 
-    # Ridge stacking
-    print("\n[3/5] Ridge stacking...")
-    ridge_oof, ridge_test = stack_ridge(X_meta_train, y, X_meta_test, target_cols)
-    ridge_auc, _ = compute_macro_auc(y, ridge_oof, target_cols)
-    print(f"  Ridge OOF: {ridge_auc:.4f} (vs baseline: {ridge_auc - baseline_auc:+.4f})")
-
     # LGBM stacking
-    print("\n[4/5] LGBM meta stacking...")
+    print("\n[3/4] LGBM meta stacking...")
     lgbm_meta_oof, lgbm_meta_test = stack_lgbm_meta(
         X_meta_train, y, X_meta_test, target_cols, device_params
     )
@@ -242,13 +204,8 @@ def main():
     print(f"  LGBM meta OOF: {lgbm_meta_auc:.4f} (vs baseline: {lgbm_meta_auc - baseline_auc:+.4f})")
 
     # Combo
-    print("\n[5/5] Optimizing combo...")
-    if lgbm_meta_auc > ridge_auc:
-        meta_oof, meta_test, meta_name = lgbm_meta_oof, lgbm_meta_test, "LGBM meta"
-    else:
-        meta_oof, meta_test, meta_name = ridge_oof, ridge_test, "Ridge"
-
-    meta_oof_rank = to_ranks(meta_oof)
+    print("\n[4/4] Optimizing combo...")
+    meta_oof_rank = to_ranks(lgbm_meta_oof)
     best_combo_auc, best_alpha = 0, 0.5
     for alpha in np.arange(0, 1.05, 0.05):
         combo = alpha * meta_oof_rank + (1 - alpha) * baseline_oof
@@ -257,16 +214,15 @@ def main():
             best_combo_auc = auc
             best_alpha = alpha
 
-    meta_test_rank = to_ranks(meta_test)
+    meta_test_rank = to_ranks(lgbm_meta_test)
     combo_test = best_alpha * meta_test_rank + (1 - best_alpha) * baseline_test
-    print(f"  Combo: {meta_name} {best_alpha:.0%} + blend {1-best_alpha:.0%}, "
+    print(f"  Combo: LGBM meta {best_alpha:.0%} + blend {1-best_alpha:.0%}, "
           f"OOF {best_combo_auc:.4f}")
 
     # Summary
     print(f"\n{'='*60}")
     results = [
         ("Rank blend", baseline_auc, baseline_test),
-        ("Ridge meta", ridge_auc, ridge_test),
         ("LGBM meta", lgbm_meta_auc, lgbm_meta_test),
         ("Combo", best_combo_auc, combo_test),
     ]

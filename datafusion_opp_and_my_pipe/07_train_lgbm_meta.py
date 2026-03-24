@@ -1,4 +1,4 @@
-"""Step 6: Train LGBM with cross-target meta-features (4 models).
+"""Step 7: Train LGBM with cross-target meta-features (4 models).
 
 Uses OOF predictions from NN, LGBM, PyBoost, CatBoost as additional features.
 For each target_i: base features + meta-features (from all models,
@@ -23,7 +23,7 @@ import polars as pl
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc
+from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc, effective_number_weight
 
 FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_lgbm_meta")
@@ -31,26 +31,42 @@ MODELS_DIR = CHECKPOINT_DIR / "models"
 
 N_CPUS = os.cpu_count() or 8
 
+# Same Optuna-tuned params as L7
 LGBM_PARAMS = dict(
     objective="binary",
     metric="auc",
-    learning_rate=0.05,
-    num_leaves=31,
-    max_depth=-1,
-    min_child_samples=20,
-    n_estimators=2000,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    reg_alpha=0.0,
-    reg_lambda=0.0,
-    subsample_freq=1,
+    learning_rate=0.050216,
+    num_leaves=34,
+    max_depth=10,
+    min_child_samples=102,
+    n_estimators=1500,
+    subsample=0.521715,
+    colsample_bytree=0.205092,
+    reg_alpha=8.146025,
+    reg_lambda=7.761833,
+    min_split_gain=0.424512,
+    subsample_freq=2,
     random_state=SEED,
     verbose=-1,
-    force_col_wise=True,
-    max_bin=255,
     n_jobs=-1,
 )
 EARLY_STOPPING_ROUNDS = 100
+
+
+def load_lgbm_meta_params():
+    """Load best params from Optuna tuning, fall back to defaults."""
+    params = dict(LGBM_PARAMS)
+    params_path = CHECKPOINT_DIR / "best_params.json"
+    if params_path.exists():
+        with open(params_path) as f:
+            tuned = json.load(f)
+        print(f"  Loaded tuned params from {params_path}")
+        params.update(tuned)
+        for k, v in tuned.items():
+            print(f"    {k}: {v}")
+    else:
+        print(f"  No tuned params found, using defaults")
+    return params
 
 
 def load_nn_predictions():
@@ -72,8 +88,8 @@ def load_nn_predictions():
 
 
 def load_model_predictions():
-    """Load OOF and test predictions from all 4 models."""
-    print("\n  Loading OOF predictions from 4 models...")
+    """Load OOF and test predictions from all 5 base models."""
+    print("\n  Loading OOF predictions from 5 models...")
 
     # NN
     nn_oof, nn_test = load_nn_predictions()
@@ -84,6 +100,12 @@ def load_model_predictions():
     lgbm_oof = d["oof_preds"].astype(np.float32)
     lgbm_test = d["test_preds"].astype(np.float32)
     print(f"    LGBM: OOF {lgbm_oof.shape}, test {lgbm_test.shape}")
+
+    # XGBoost
+    d = np.load("checkpoints_xgboost/xgb_predictions.npz")
+    xgb_oof = d["oof_preds"].astype(np.float32)
+    xgb_test = d["test_preds"].astype(np.float32)
+    print(f"    XGBoost: OOF {xgb_oof.shape}, test {xgb_test.shape}")
 
     # PyBoost
     d = np.load("checkpoints_pyboost/pyboost_predictions.npz")
@@ -97,23 +119,25 @@ def load_model_predictions():
     cb_test = d["test_preds"].astype(np.float32)
     print(f"    CatBoost: OOF {cb_oof.shape}, test {cb_test.shape}")
 
-    # Stack: [LGBM | NN | PyBoost | CatBoost]
-    meta_train = np.hstack([lgbm_oof, nn_oof, pb_oof, cb_oof])
-    meta_test = np.hstack([lgbm_test, nn_test, pb_test, cb_test])
+    # Stack: [LGBM | NN | XGBoost | PyBoost | CatBoost]
+    meta_train = np.hstack([lgbm_oof, nn_oof, xgb_oof, pb_oof, cb_oof])
+    meta_test = np.hstack([lgbm_test, nn_test, xgb_test, pb_test, cb_test])
     print(f"    Combined meta: {meta_train.shape}")
     return meta_train, meta_test
 
 
 def main():
     t0 = time.time()
-    n_models = 4
+    n_models = 5
     print("=" * 60)
-    print(f"Step 6: LGBM with cross-target meta-features ({n_models} models)")
+    print(f"Step 7: LGBM with cross-target meta-features ({n_models} models)")
     print("=" * 60)
 
     # Force CPU: parallel targets on 224 cores is faster than sequential GPU
     device_params, supports_cat = {}, True
     print(f"  LightGBM: CPU mode, {N_CPUS} threads")
+
+    lgbm_params = load_lgbm_meta_params()
 
     # 1. Load base features
     print("\n[1/4] Loading features...")
@@ -202,10 +226,10 @@ def main():
                     X_test_full[:, c] = np.nan
 
                 y_t = y_tr[:, i]
-                n_neg = (y_t == 0).sum()
-                n_pos = (y_t == 1).sum()
-                spw = n_neg / max(n_pos, 1)
-                params = {**LGBM_PARAMS, "scale_pos_weight": spw, **device_params}
+                n_neg = int((y_t == 0).sum())
+                n_pos = int((y_t == 1).sum())
+                spw = effective_number_weight(n_pos, n_neg)
+                params = {**lgbm_params, "scale_pos_weight": spw, **device_params}
                 model = lgb.LGBMClassifier(**params)
                 model.fit(
                     X_tr_full, y_tr[:, i],
@@ -257,7 +281,7 @@ def main():
     # so pruning is stable across re-runs
     importance_avg = importance_sum / N_FOLDS
     meta_col_names = []
-    model_names = ["lgbm", "nn", "pyboost", "catboost"]
+    model_names = ["lgbm", "nn", "xgboost", "pyboost", "catboost"]
     for m_name in model_names:
         for tcol in target_cols:
             meta_col_names.append(f"meta_{m_name}_{tcol}")

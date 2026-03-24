@@ -8,8 +8,8 @@ from scipy.stats import rankdata
 from sklearn.metrics import roc_auc_score
 
 SEED = 1234
-DATA_DIR = str(Path(__file__).resolve().parent.parent) + "/"
-N_FOLDS = 5
+DATA_DIR = str(Path(__file__).resolve().parent.parent.parent) + "/"
+N_FOLDS = 4
 
 
 def get_device():
@@ -103,6 +103,18 @@ def log_per_target_auc(aucs, y_true, target_cols, top_worst=5):
     print(f"\n  Distribution: min={auc_values.min():.4f}  Q25={np.percentile(auc_values, 25):.4f}  "
           f"median={np.median(auc_values):.4f}  Q75={np.percentile(auc_values, 75):.4f}  "
           f"max={auc_values.max():.4f}")
+
+
+def effective_number_weight(n_pos, n_neg, beta=0.999):
+    """Class-balanced weight using effective number of samples.
+
+    E_n = (1 - beta^n) / (1 - beta).  Weight = E_neg / E_pos.
+    When beta -> 1: reduces to n_neg / n_pos (standard).
+    When beta -> 0: all samples equally important (weight -> 1).
+    """
+    E_pos = (1.0 - beta ** n_pos) / (1.0 - beta)
+    E_neg = (1.0 - beta ** n_neg) / (1.0 - beta)
+    return E_neg / max(E_pos, 1e-8)
 
 
 def to_ranks(arr):

@@ -12,7 +12,7 @@ from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from utils import detect_lgbm_device, get_device
+from utils.utils import detect_lgbm_device, get_device
 
 try:
     from packaging.requirements import Requirement
@@ -188,11 +188,12 @@ def print_training_plan() -> None:
     print(f"01_feature_engineering.py   -> CPU")
     print(f"02_train_nn.py             -> {nn_device}")
     print(f"03_train_lgbm.py           -> CPU")
-    print(f"04_train_pyboost.py        -> {pyboost_device}")
-    print(f"05_train_catboost.py       -> {catboost_device}")
-    print(f"06_train_lgbm_meta.py      -> CPU")
-    print(f"07_blend.py                -> CPU")
-    print(f"08_stacking.py             -> Ridge=CPU, LGBM meta=CPU")
+    print(f"04_train_xgboost.py        -> CPU")
+    print(f"05_train_pyboost.py        -> {pyboost_device}")
+    print(f"06_train_catboost.py       -> {catboost_device}")
+    print(f"07_train_lgbm_meta.py      -> CPU")
+    print(f"08_blend.py                -> CPU")
+    print(f"09_stacking.py             -> LGBM meta=CPU")
 
     print("\nNotes:")
     print(f"- NN: {nn_note}")

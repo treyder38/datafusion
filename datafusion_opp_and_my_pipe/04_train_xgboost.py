@@ -1,11 +1,11 @@
-"""Step 3: Train LightGBM (Optuna-tuned params, 5-fold).
+"""Step 4: Train XGBoost (4-fold x 41 targets).
 
 Loads features from features/, trains 41 per-target binary classifiers.
-Targets are trained in parallel batches for speed.
+Targets are trained in parallel batches for speed (XGBoost releases GIL).
 
-Output: checkpoints_lgbm/lgbm_predictions.npz (oof_preds, test_preds)
+Output: checkpoints_xgboost/xgb_predictions.npz (oof_preds, test_preds)
 
-Runtime: ~5-10 minutes.
+Runtime: ~10-20 minutes.
 """
 
 import gc
@@ -17,48 +17,44 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import lightgbm as lgb
 import numpy as np
 import polars as pl
+import xgboost as xgb
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
 from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc, effective_number_weight
 
 FEATURES_DIR = Path("features")
-CHECKPOINT_DIR = Path("checkpoints_lgbm")
+CHECKPOINT_DIR = Path("checkpoints_xgboost")
 MODELS_DIR = CHECKPOINT_DIR / "models"
 
-# ThreadPoolExecutor: LightGBM releases GIL during C++ training,
-# so threads are truly parallel. No data copying, no pickle overhead.
 N_CPUS = os.cpu_count() or 8
-PARALLEL_TARGETS = min(4, max(2, N_CPUS // 16))  # 64 cores → 4 parallel, 224 → 4 (capped)
-THREADS_PER_MODEL = max(1, N_CPUS // PARALLEL_TARGETS)  # 64 cores / 4 = 16 threads each
+PARALLEL_TARGETS = min(4, max(2, N_CPUS // 16))
+THREADS_PER_MODEL = max(1, N_CPUS // PARALLEL_TARGETS)
 
-# Optuna-tuned params (L7, 30 trials)
-LGBM_PARAMS = dict(
-    objective="binary",
-    metric="auc",
-    learning_rate=0.050216,
-    num_leaves=34,
-    max_depth=10,
-    min_child_samples=102,
-    n_estimators=1500,
-    subsample=0.521715,
-    colsample_bytree=0.205092,
-    reg_alpha=8.146025,
-    reg_lambda=7.761833,
-    min_split_gain=0.424512,
-    subsample_freq=2,
+XGB_PARAMS = dict(
+    objective="binary:logistic",
+    eval_metric="auc",
+    tree_method="hist",
+    learning_rate=0.05,
+    max_depth=8,
+    min_child_weight=50,
+    n_estimators=2000,
+    subsample=0.7,
+    colsample_bytree=0.3,
+    reg_alpha=5.0,
+    reg_lambda=5.0,
+    gamma=0.5,
     random_state=SEED,
-    verbose=-1,
+    verbosity=0,
 )
 EARLY_STOPPING_ROUNDS = 100
 
 
-def load_lgbm_params():
+def load_xgb_params():
     """Load best params from Optuna tuning, fall back to defaults."""
-    params = dict(LGBM_PARAMS)
+    params = dict(XGB_PARAMS)
     params_path = CHECKPOINT_DIR / "best_params.json"
     if params_path.exists():
         with open(params_path) as f:
@@ -73,34 +69,26 @@ def load_lgbm_params():
 
 
 def _train_one_target(target_idx, target_name, fold_idx, threads,
-                      cat_indices, supports_cat, device_params,
                       X_tr, y_tr, X_val, y_val, X_test,
-                      lgbm_params):
-    """Train a single target — runs in a thread (GIL released by LightGBM C++)."""
+                      xgb_params):
+    """Train a single target — runs in a thread (XGBoost releases GIL)."""
     y_t = y_tr[:, target_idx]
     n_neg = int((y_t == 0).sum())
     n_pos = int((y_t == 1).sum())
     spw = effective_number_weight(n_pos, n_neg)
-    params = {**lgbm_params, "n_jobs": threads, "scale_pos_weight": spw, **device_params}
+    params = {**xgb_params, "nthread": threads, "scale_pos_weight": spw}
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        model = lgb.LGBMClassifier(**params)
-        model.fit(
-            X_tr, y_tr[:, target_idx],
-            eval_set=[(X_val, y_val[:, target_idx])],
-            eval_metric="auc",
-            callbacks=[
-                lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False),
-                lgb.log_evaluation(period=0),
-            ],
-            categorical_feature=cat_indices if supports_cat else "auto",
-        )
+    model = xgb.XGBClassifier(**params)
+    model.fit(
+        X_tr, y_tr[:, target_idx],
+        eval_set=[(X_val, y_val[:, target_idx])],
+        verbose=False,
+    )
 
     val_preds = model.predict_proba(X_val)[:, 1]
     test_preds = model.predict_proba(X_test)[:, 1]
-    model.booster_.save_model(str(MODELS_DIR / f"{target_name}_fold{fold_idx}.lgb"))
-    importance = model.booster_.feature_importance(importance_type="gain")
+    model.save_model(str(MODELS_DIR / f"{target_name}_fold{fold_idx}.json"))
+    importance = model.feature_importances_
 
     return val_preds, test_preds, importance
 
@@ -108,24 +96,20 @@ def _train_one_target(target_idx, target_name, fold_idx, threads,
 def main():
     t0 = time.time()
     print("=" * 60)
-    print("Step 3: Train LightGBM (5-fold × 41 targets)")
+    print(f"Step 4: Train XGBoost ({N_FOLDS}-fold × 41 targets)")
     print("=" * 60)
+    print(f"  XGBoost: CPU mode, {PARALLEL_TARGETS} parallel targets × {THREADS_PER_MODEL} threads")
 
-    # Force CPU: 224 cores with parallel targets is faster than sequential GPU
-    device_params, supports_cat = {}, True
-    print(f"  LightGBM: CPU mode, {PARALLEL_TARGETS} parallel targets × {THREADS_PER_MODEL} threads")
-
-    lgbm_params = load_lgbm_params()
+    xgb_params = load_xgb_params()
+    xgb_params["early_stopping_rounds"] = EARLY_STOPPING_ROUNDS
 
     # 1. Load features
     print("\n[1/4] Loading features...")
     with open(FEATURES_DIR / "meta.json") as f:
         meta = json.load(f)
-    all_feature_cols = meta["feature_names"]  # full list — never changes
+    all_feature_cols = meta["feature_names"]
     feature_cols = list(all_feature_cols)
-    cat_feature_names = meta["cat_cols"]
     target_cols = meta["target_cols"]
-    cat_indices = [feature_cols.index(c) for c in cat_feature_names]
 
     train_feat = pl.read_parquet(FEATURES_DIR / "train_features.parquet")
     test_feat = pl.read_parquet(FEATURES_DIR / "test_features.parquet")
@@ -136,12 +120,12 @@ def main():
     y_train = train_tgt.select(target_cols).to_numpy().astype(np.float32)
 
     print(f"  X_train: {X_train.shape}, X_test: {X_test.shape}")
-    print(f"  Features: {len(cat_feature_names)} cat, {len(feature_cols) - len(cat_feature_names)} num")
+    print(f"  Features: {len(feature_cols)}")
 
     # 2. Check cache
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = CHECKPOINT_DIR / "lgbm_predictions.npz"
+    cache_file = CHECKPOINT_DIR / "xgb_predictions.npz"
     if cache_file.exists():
         print(f"\n  Predictions exist at {cache_file}! Delete to retrain.")
         return
@@ -168,16 +152,13 @@ def main():
         y_val = y_train[val_idx]
         fold_test_preds = np.zeros((n_test, n_targets))
 
-        # Parallel training across targets using threads
-        # LightGBM releases GIL → threads are truly parallel, zero copy overhead
         with ThreadPoolExecutor(max_workers=PARALLEL_TARGETS) as executor:
             futures = {}
             for i, col in enumerate(target_cols):
                 futures[executor.submit(
                     _train_one_target, i, col, fold_idx, THREADS_PER_MODEL,
-                    cat_indices, supports_cat, device_params,
                     X_tr, y_tr, X_val, y_val, X_test,
-                    lgbm_params,
+                    xgb_params,
                 )] = i
 
             done_count = 0
@@ -211,30 +192,28 @@ def main():
              fold_aucs=np.array(fold_aucs))
     print(f"  Saved: {cache_file}")
 
-    # Save averaged feature importances — always keyed by full feature list
+    # Save averaged feature importances
     importance_avg = importance_sum / N_FOLDS
-    full_imp = importance_avg
-
     imp_path = CHECKPOINT_DIR / "feature_importances.json"
     imp_data = {
         "feature_names": all_feature_cols,
         "target_cols": target_cols,
         "importances_per_target": {
             col: dict(sorted(
-                zip(all_feature_cols, full_imp[:, i].tolist()),
+                zip(all_feature_cols, importance_avg[:, i].tolist()),
                 key=lambda x: x[1], reverse=True
             ))
             for i, col in enumerate(target_cols)
         },
         "mean_importance": dict(sorted(
-            zip(all_feature_cols, full_imp.mean(axis=1).tolist()),
+            zip(all_feature_cols, importance_avg.mean(axis=1).tolist()),
             key=lambda x: x[1], reverse=True
         )),
     }
     with open(imp_path, "w") as f:
         json.dump(imp_data, f, indent=2)
     print(f"  Saved: {imp_path}")
-    print(f"  Models: {MODELS_DIR}/ ({N_FOLDS * n_targets} .lgb files)")
+    print(f"  Models: {MODELS_DIR}/ ({N_FOLDS * n_targets} .json files)")
 
     # Save submission
     print("\n[4/4] Saving submission...")
@@ -246,8 +225,8 @@ def main():
     )
     verify_submission(submit, sample)
     Path("submissions").mkdir(exist_ok=True)
-    submit.write_parquet("submissions/lgbm.parquet")
-    print(f"  Saved: submissions/lgbm.parquet")
+    submit.write_parquet("submissions/xgboost.parquet")
+    print(f"  Saved: submissions/xgboost.parquet")
 
     print(f"\nDone in {(time.time()-t0)/60:.1f} min. OOF={oof_auc:.4f}")
 

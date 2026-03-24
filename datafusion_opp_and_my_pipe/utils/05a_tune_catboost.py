@@ -7,7 +7,7 @@ Usage:
     python 05a_tune_catboost.py [--n-trials 50] [--n-targets 10]
 
 After tuning, delete checkpoints_catboost/cb_predictions.npz
-and re-run 05_train_catboost.py (it will load best_params.json automatically).
+and re-run 06_train_catboost.py (it will load best_params.json automatically).
 
 Runtime: ~2-4 hours (GPU), depends on n_trials.
 """
@@ -27,7 +27,7 @@ from catboost import CatBoostClassifier, Pool
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc
+from utils.utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc
 
 FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_catboost")
@@ -215,7 +215,7 @@ def main():
     print(f"  Saved: {trials_path}")
 
     print(f"\nDone in {(time.time()-t0)/60:.1f} min.")
-    print(f"\nNext: delete checkpoints_catboost/cb_predictions.npz and re-run 05_train_catboost.py")
+    print(f"\nNext: delete checkpoints_catboost/cb_predictions.npz and re-run 06_train_catboost.py")
 
 
 if __name__ == "__main__":

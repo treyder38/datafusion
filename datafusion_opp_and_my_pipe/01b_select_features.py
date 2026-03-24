@@ -20,7 +20,7 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import polars as pl
-from utils import SEED
+from utils import SEED, effective_number_weight
 
 FEATURES_DIR = Path("features")
 SELECTED_DIR = FEATURES_DIR / "selected_features"
@@ -64,9 +64,9 @@ def select_features_for_target(X, y, feature_names):
     """Train N-fold LGBM and return top-K features by averaged gain importance."""
     from sklearn.model_selection import StratifiedKFold
 
-    n_neg = (y == 0).sum()
-    n_pos = (y == 1).sum()
-    spw = n_neg / max(n_pos, 1)
+    n_neg = int((y == 0).sum())
+    n_pos = int((y == 1).sum())
+    spw = effective_number_weight(n_pos, n_neg)
 
     importance_sum = np.zeros(X.shape[1], dtype=np.float64)
     kf = StratifiedKFold(n_splits=N_SELECTION_FOLDS, shuffle=True, random_state=SEED)

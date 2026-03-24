@@ -1,4 +1,4 @@
-"""Step 4: Train PyBoost (SketchBoost, requires NVIDIA GPU with CUDA).
+"""Step 5: Train PyBoost (SketchBoost, requires NVIDIA GPU with CUDA).
 
 Loads features from features/, trains SketchBoost multi-output model.
 
@@ -44,7 +44,7 @@ PARAMS = dict(
 def main():
     t0 = time.time()
     print("=" * 60)
-    print("Step 4: Train PyBoost (SketchBoost)")
+    print("Step 5: Train PyBoost (SketchBoost)")
     print("=" * 60)
 
     # Check CUDA

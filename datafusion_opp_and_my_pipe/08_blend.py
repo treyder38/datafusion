@@ -1,6 +1,6 @@
-"""Step 7: Rank per-target blend (NN + LGBM + PyBoost + CatBoost + LGBM meta).
+"""Step 8: Rank per-target blend (NN + LGBM + XGBoost + PyBoost + CatBoost + LGBM meta).
 
-Per-target weight optimization on OOF via grid search (5 models).
+Per-target weight optimization on OOF via grid search (6 models).
 
 Output: submissions/blend.parquet
 
@@ -36,43 +36,52 @@ def load_nn():
     return oof, np.mean(test_parts, axis=0)
 
 
+def _gen_weight_combos(n_models, step):
+    """Generate all weight combinations that sum to ~1.0."""
+    grid = np.arange(0, 1.01, step)
+    def _recurse(depth, remaining):
+        if depth == n_models - 1:
+            if remaining >= -0.001:
+                yield (remaining,)
+            return
+        for w in grid:
+            if w > remaining + 0.001:
+                break
+            for rest in _recurse(depth + 1, remaining - w):
+                yield (w,) + rest
+    return _recurse(0, 1.0)
+
+
 def optimize_per_target(oof_ranks, y, target_cols, n_models, step=0.10):
     """Per-target weight optimization for N-model rank blend."""
     n_targets = len(target_cols)
     default_w = [1.0 / n_models] * n_models
     weights = np.zeros((n_targets, n_models))
+    # Precompute weight combos (shared across targets)
+    combos = list(_gen_weight_combos(n_models, step))
     for i in range(n_targets):
         y_t = y[:, i]
         if y_t.sum() < 2 or (len(y_t) - y_t.sum()) < 2:
             weights[i] = default_w
             continue
+        ranks_i = np.column_stack([oof_ranks[m][:, i] for m in range(n_models)])
         best_auc, best_w = 0.0, default_w[:]
-        # Grid search over n_models-1 free weights
-        grid = np.arange(0, 1.01, step)
-        for w0 in grid:
-            for w1 in np.arange(0, 1.01 - w0, step):
-                for w2 in np.arange(0, 1.01 - w0 - w1, step):
-                    for w3 in np.arange(0, 1.01 - w0 - w1 - w2, step):
-                        w4 = 1.0 - w0 - w1 - w2 - w3
-                        if w4 < -0.001:
-                            continue
-                        blended = (w0 * oof_ranks[0][:, i] + w1 * oof_ranks[1][:, i]
-                                   + w2 * oof_ranks[2][:, i] + w3 * oof_ranks[3][:, i]
-                                   + w4 * oof_ranks[4][:, i])
-                        auc = roc_auc_score(y_t, blended)
-                        if auc > best_auc:
-                            best_auc = auc
-                            best_w = [w0, w1, w2, w3, w4]
+        for combo in combos:
+            blended = ranks_i @ np.array(combo)
+            auc = roc_auc_score(y_t, blended)
+            if auc > best_auc:
+                best_auc = auc
+                best_w = list(combo)
         weights[i] = best_w
     return weights
 
 
 def main():
     t0 = time.time()
-    model_names = ["NN", "LGBM", "PyBoost", "CatBoost", "LGBM_meta"]
+    model_names = ["NN", "LGBM", "XGBoost", "PyBoost", "CatBoost", "LGBM_meta"]
     n_models = len(model_names)
     print("=" * 60)
-    print(f"Step 7: Rank per-target blend ({' + '.join(model_names)})")
+    print(f"Step 8: Rank per-target blend ({' + '.join(model_names)})")
     print("=" * 60)
 
     # Load targets
@@ -91,6 +100,11 @@ def main():
     lgbm_auc, _ = compute_macro_auc(y, oof_lgbm, target_cols)
     print(f"  LGBM: OOF {lgbm_auc:.5f}")
 
+    d = np.load("checkpoints_xgboost/xgb_predictions.npz")
+    oof_xgb, test_xgb = d["oof_preds"], d["test_preds"]
+    xgb_auc, _ = compute_macro_auc(y, oof_xgb, target_cols)
+    print(f"  XGBoost: OOF {xgb_auc:.5f}")
+
     d = np.load("checkpoints_pyboost/pyboost_predictions.npz")
     oof_pb, test_pb = d["oof_preds"], d["test_preds"]
     pb_auc, _ = compute_macro_auc(y, oof_pb, target_cols)
@@ -108,10 +122,10 @@ def main():
 
     # Rank per-target optimization
     print(f"\n[2/3] Optimizing per-target weights ({n_models} models, step=0.10)...")
-    oof_ranks = [to_ranks(oof_nn), to_ranks(oof_lgbm), to_ranks(oof_pb),
-                 to_ranks(oof_cb), to_ranks(oof_lgbm_meta)]
-    test_ranks = [to_ranks(test_nn), to_ranks(test_lgbm), to_ranks(test_pb),
-                  to_ranks(test_cb), to_ranks(test_lgbm_meta)]
+    oof_ranks = [to_ranks(oof_nn), to_ranks(oof_lgbm), to_ranks(oof_xgb),
+                 to_ranks(oof_pb), to_ranks(oof_cb), to_ranks(oof_lgbm_meta)]
+    test_ranks = [to_ranks(test_nn), to_ranks(test_lgbm), to_ranks(test_xgb),
+                  to_ranks(test_pb), to_ranks(test_cb), to_ranks(test_lgbm_meta)]
 
     weights = optimize_per_target(oof_ranks, y, target_cols, n_models, step=0.10)
 
@@ -150,6 +164,7 @@ def main():
     np.savez_compressed("blend_artifacts/blend_data.npz",
                         oof_nn=oof_nn, test_nn=test_nn,
                         oof_lgbm=oof_lgbm, test_lgbm=test_lgbm,
+                        oof_xgb=oof_xgb, test_xgb=test_xgb,
                         oof_pb=oof_pb, test_pb=test_pb,
                         oof_cb=oof_cb, test_cb=test_cb,
                         oof_lgbm_meta=oof_lgbm_meta, test_lgbm_meta=test_lgbm_meta,

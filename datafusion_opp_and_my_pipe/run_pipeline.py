@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-N_FOLDS = 5
+N_FOLDS = 4
 
 
 @dataclass(frozen=True)
@@ -64,40 +64,47 @@ STEPS = [
         label="LightGBM",
         script="03_train_lgbm.py",
         outputs=("checkpoints_lgbm/lgbm_predictions.npz",),
-        depends_on=("fe", "feat_sel"),
+        depends_on=("fe",),
+    ),
+    Step(
+        key="xgboost",
+        label="XGBoost",
+        script="04_train_xgboost.py",
+        outputs=("checkpoints_xgboost/xgb_predictions.npz",),
+        depends_on=("fe",),
     ),
     Step(
         key="pyboost",
         label="PyBoost",
-        script="04_train_pyboost.py",
+        script="05_train_pyboost.py",
         outputs=("checkpoints_pyboost/pyboost_predictions.npz",),
         depends_on=("fe",),
     ),
     Step(
         key="catboost",
         label="CatBoost",
-        script="05_train_catboost.py",
+        script="06_train_catboost.py",
         outputs=("checkpoints_catboost/cb_predictions.npz",),
         depends_on=("fe", "feat_sel"),
     ),
     Step(
         key="lgbm_meta",
         label="LGBM meta",
-        script="06_train_lgbm_meta.py",
+        script="07_train_lgbm_meta.py",
         outputs=("checkpoints_lgbm_meta/lgbm_predictions.npz",),
-        depends_on=("fe", "nn", "lgbm", "pyboost", "catboost"),
+        depends_on=("fe", "nn", "lgbm", "xgboost", "pyboost", "catboost"),
     ),
     Step(
         key="blend",
         label="Blend",
-        script="07_blend.py",
+        script="08_blend.py",
         outputs=("blend_artifacts/blend_data.npz", "submissions/blend.parquet"),
-        depends_on=("nn", "lgbm", "pyboost", "catboost", "lgbm_meta"),
+        depends_on=("nn", "lgbm", "xgboost", "pyboost", "catboost", "lgbm_meta"),
     ),
     Step(
         key="stacking",
         label="Stacking",
-        script="08_stacking.py",
+        script="09_stacking.py",
         outputs=("submissions/stacking.parquet",),
         depends_on=("blend",),
     ),

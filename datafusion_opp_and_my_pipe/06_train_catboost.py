@@ -1,4 +1,4 @@
-"""Step 5: Train CatBoost (5-fold x 41 targets).
+"""Step 6: Train CatBoost (5-fold x 41 targets).
 
 Loads features from features/, trains 41 per-target binary classifiers.
 CatBoost handles categoricals natively — no label encoding needed.
@@ -77,7 +77,7 @@ def detect_task_type():
 def main():
     t0 = time.time()
     print("=" * 60)
-    print("Step 5: Train CatBoost (5-fold x 41 targets)")
+    print("Step 6: Train CatBoost (5-fold x 41 targets)")
     print("=" * 60)
 
     task_type, devices = detect_task_type()
