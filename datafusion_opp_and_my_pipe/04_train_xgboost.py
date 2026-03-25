@@ -64,32 +64,30 @@ def get_rarity_tier_params(n_pos):
         return None  # Use default Optuna-tuned params
 
 
-def focal_loss_objective(y_pred, y_true):
-    """Focal loss for XGBoost: focuses on hard negatives."""
-    from scipy.special import expit  # sigmoid
-    y_pred_prob = expit(y_pred)
+def focal_loss_objective(y_pred, dtrain):
+    """Focal loss for XGBoost: down-weights easy-to-classify samples.
 
-    # Focal loss: -alpha * (1-p)^gamma * log(p) for y=1, -alpha * p^gamma * log(1-p) for y=0
-    # Simplified: down-weight easy negatives with gamma=2
+    Uses the correct XGBoost custom objective signature: (preds, DMatrix).
+    Proper focal cross-entropy: L = -(1-p)^gamma * log(p) for y=1,
+                                  -p^gamma * log(1-p) for y=0.
+    """
+    from scipy.special import expit
+    y_true = dtrain.get_label()
+    p = np.clip(expit(y_pred), 1e-7, 1 - 1e-7)
     gamma = 2.0
-    epsilon = 1e-7
 
-    # Clip predictions to avoid log(0)
-    y_pred_prob = np.clip(y_pred_prob, epsilon, 1 - epsilon)
+    # Focal CE gradient w.r.t. raw logit f (where p = sigmoid(f)):
+    # For y=1: dL/df = (1-p)^gamma * (gamma*p*log(p) + p - 1)
+    # For y=0: dL/df = p^gamma * (gamma*(1-p)*log(1-p) - p + 1) ... but simplified:
+    # Standard approach: use the normal BCE gradient scaled by focal weight
+    # grad_bce = p - y, focal_weight = ((1-p)^gamma if y=1 else p^gamma)
+    focal_weight = np.where(y_true == 1, (1 - p) ** gamma, p ** gamma)
+    grad = focal_weight * (p - y_true)
 
-    # Gradient and hessian for focal loss
-    p = y_pred_prob
-    grad = np.where(
-        y_true == 1,
-        -(1 - p) ** gamma,  # positive class
-        p ** gamma  # negative class (down-weighted)
-    )
-
-    hess = np.where(
-        y_true == 1,
-        gamma * (1 - p) ** (gamma - 1) * p * (1 - p),
-        -gamma * p ** (gamma - 1) * (1 - p) * p
-    )
+    # Hessian: use |grad| * (1 - |grad|) approximation, clamped positive
+    # This is the standard numerically-stable focal loss hessian
+    hess = focal_weight * p * (1 - p)
+    hess = np.maximum(hess, 1e-7)  # GBDTs require non-negative hessians
 
     return grad, hess
 
@@ -163,7 +161,7 @@ def _train_one_target(target_idx, target_name, fold_idx, threads,
     val_preds = model.predict_proba(X_val)[:, 1]
     test_preds = model.predict_proba(X_test)[:, 1]
     model.save_model(str(MODELS_DIR / f"{target_name}_fold{fold_idx}.json"))
-    importance = model.feature_importances_
+    importance = model.feature_importances_[:n_base_features]  # exclude OOF cols
 
     return val_preds, test_preds, importance
 
@@ -224,13 +222,15 @@ def main():
     oof_preds = np.zeros((n_train, n_targets))
     test_preds_sum = np.zeros((n_test, n_targets))
     fold_aucs = []
-    importance_sum = np.zeros((len(feature_cols), n_targets), dtype=np.float64)
+    # Only track importance for base features (not OOF columns)
+    n_base_features_for_imp = len(feature_cols)
+    importance_sum = np.zeros((n_base_features_for_imp, n_targets), dtype=np.float64)
 
     kf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     print(f"\n[2/4] Training {N_FOLDS}-Fold × {n_targets} targets...", flush=True)
 
-    # Track OOF feature columns for masking
-    n_base_features = len(feature_cols) if not has_oof_features else len(feature_cols)
+    # Number of base features (without OOF columns) — used for masking and importance
+    n_base_features = len(feature_cols)
     fold_aucs_per_target = {}  # Track per-target AUC from fold 1 for difficulty override
 
     for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(np.arange(n_train), y_train)):

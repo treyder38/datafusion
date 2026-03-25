@@ -150,10 +150,8 @@ def optimize_rank_blend(oof_list, y, target_cols, n_models, step=0.10):
 
 def main():
     t0 = time.time()
-    model_names = ["NN", "TabR", "LGBM", "XGBoost", "PyBoost", "CatBoost", "LGBM_meta"]
-    n_models = len(model_names)
     print("=" * 60)
-    print(f"Step 9: Stacking (LGBM meta + combo, {n_models} models)")
+    print("Step 9: Stacking (LGBM meta + combo)")
     print("=" * 60)
 
     # Keep the meta-learner on CPU. This stage is small enough that CPU is fast,
@@ -167,45 +165,43 @@ def main():
     y = train_tgt.select(target_cols).to_numpy().astype(np.float32)
     n_train, n_targets = y.shape
 
-    # Load predictions
+    # Load predictions — dynamic model list (TabR optional)
     print("\n[1/4] Loading predictions...")
     d = np.load("blend_artifacts/blend_data.npz")
+    model_names = []
+    oof_arrays, test_arrays = [], []
+
     oof_nn = d["oof_nn"].astype(np.float32)
     test_nn = d["test_nn"].astype(np.float32)
+    model_names.append("NN"); oof_arrays.append(oof_nn); test_arrays.append(test_nn)
 
-    # TabR available but optional
     if "oof_tabr" in d:
         oof_tabr = d["oof_tabr"].astype(np.float32)
         test_tabr = d["test_tabr"].astype(np.float32)
-    else:
-        # Fallback: use NN if TabR not available
-        oof_tabr = oof_nn
-        test_tabr = test_nn
+        model_names.append("TabR"); oof_arrays.append(oof_tabr); test_arrays.append(test_tabr)
 
-    oof_lgbm = d["oof_lgbm"].astype(np.float32)
-    test_lgbm = d["test_lgbm"].astype(np.float32)
-    oof_xgb = d["oof_xgb"].astype(np.float32)
-    test_xgb = d["test_xgb"].astype(np.float32)
-    oof_pb = d["oof_pb"].astype(np.float32)
-    test_pb = d["test_pb"].astype(np.float32)
-    oof_cb = d["oof_cb"].astype(np.float32)
-    test_cb = d["test_cb"].astype(np.float32)
-    oof_lgbm_meta = d["oof_lgbm_meta"].astype(np.float32)
-    test_lgbm_meta = d["test_lgbm_meta"].astype(np.float32)
+    oof_lgbm = d["oof_lgbm"].astype(np.float32); test_lgbm = d["test_lgbm"].astype(np.float32)
+    model_names.append("LGBM"); oof_arrays.append(oof_lgbm); test_arrays.append(test_lgbm)
+    oof_xgb = d["oof_xgb"].astype(np.float32); test_xgb = d["test_xgb"].astype(np.float32)
+    model_names.append("XGBoost"); oof_arrays.append(oof_xgb); test_arrays.append(test_xgb)
+    oof_pb = d["oof_pb"].astype(np.float32); test_pb = d["test_pb"].astype(np.float32)
+    model_names.append("PyBoost"); oof_arrays.append(oof_pb); test_arrays.append(test_pb)
+    oof_cb = d["oof_cb"].astype(np.float32); test_cb = d["test_cb"].astype(np.float32)
+    model_names.append("CatBoost"); oof_arrays.append(oof_cb); test_arrays.append(test_cb)
+    oof_lgbm_meta = d["oof_lgbm_meta"].astype(np.float32); test_lgbm_meta = d["test_lgbm_meta"].astype(np.float32)
+    model_names.append("LGBM_meta"); oof_arrays.append(oof_lgbm_meta); test_arrays.append(test_lgbm_meta)
 
+    n_models = len(model_names)
     n_test = test_nn.shape[0]
-    for name, oof in [("NN", oof_nn), ("TabR", oof_tabr), ("LGBM", oof_lgbm), ("XGBoost", oof_xgb),
-                      ("PyBoost", oof_pb), ("CatBoost", oof_cb), ("LGBM_meta", oof_lgbm_meta)]:
+    for name, oof in zip(model_names, oof_arrays):
         auc, _ = compute_macro_auc(y, oof, target_cols)
         print(f"  {name}: {auc:.4f}")
+    print(f"  Total models: {n_models}")
 
     # Rank blend baseline
     print(f"\n  Computing rank blend baseline ({n_models} models)...")
-    blend_weights, oof_ranks = optimize_rank_blend(
-        [oof_nn, oof_tabr, oof_lgbm, oof_xgb, oof_pb, oof_cb, oof_lgbm_meta], y, target_cols, n_models
-    )
-    test_ranks = [to_ranks(test_nn), to_ranks(test_tabr), to_ranks(test_lgbm), to_ranks(test_xgb),
-                  to_ranks(test_pb), to_ranks(test_cb), to_ranks(test_lgbm_meta)]
+    blend_weights, oof_ranks = optimize_rank_blend(oof_arrays, y, target_cols, n_models)
+    test_ranks = [to_ranks(t) for t in test_arrays]
 
     baseline_oof = np.zeros_like(oof_nn)
     baseline_test = np.zeros_like(test_nn)
@@ -217,12 +213,10 @@ def main():
     baseline_auc, _ = compute_macro_auc(y, baseline_oof, target_cols)
     print(f"  Rank blend baseline: {baseline_auc:.4f}")
 
-    # Build meta-features (7 models) with logit calibration
-    print("\n[2/4] Building meta-features with logit calibration...")
-    # Apply logit transformation to all OOF and test predictions
-    # This maps probabilities to wider range, helping tree-based meta-learners find better splits
-    oof_logit = apply_logit_transform(oof_nn, oof_tabr, oof_lgbm, oof_xgb, oof_pb, oof_cb, oof_lgbm_meta)
-    test_logit = apply_logit_transform(test_nn, test_tabr, test_lgbm, test_xgb, test_pb, test_cb, test_lgbm_meta)
+    # Build meta-features with logit calibration
+    print(f"\n[2/4] Building meta-features with logit calibration ({n_models} models)...")
+    oof_logit = apply_logit_transform(*oof_arrays)
+    test_logit = apply_logit_transform(*test_arrays)
 
     X_meta_train = build_meta_features(*oof_logit)
     X_meta_test = build_meta_features(*test_logit)

@@ -83,14 +83,6 @@ def get_rarity_tier_params(n_pos):
         return None  # Use default Optuna-tuned params
 
 
-def apply_label_smoothing(y, epsilon=0.05):
-    """Apply label smoothing to binary targets.
-
-    Smooths hard labels {0, 1} toward center {epsilon, 1-epsilon}.
-    This encourages calibrated probability predictions and prevents overconfident models.
-    """
-    return epsilon + (1 - 2 * epsilon) * y
-
 
 def detect_task_type():
     """Detect GPU availability for CatBoost."""
@@ -201,9 +193,6 @@ def main():
             y = y_train[:, i]
             n_pos = int((y[tr_idx] == 1).sum())
 
-            # Apply label smoothing to prevent overconfident predictions
-            y_smooth = apply_label_smoothing(y, epsilon=0.05)
-
             params = dict(cb_params)
             params["random_seed"] = SEED + fold_idx
             params["auto_class_weights"] = "Balanced"
@@ -236,7 +225,7 @@ def main():
                 X_te_t = X_test[sel_cols].copy()
             else:
                 sel_cols = list(X_train.columns)  # Include OOF features if loaded
-                sel_cats = cat_feature_names
+                sel_cats = list(cat_feature_names)  # copy to avoid mutating global list
                 X_tr_t = X_train.iloc[tr_idx].copy()
                 X_va_t = X_train.iloc[val_idx].copy()
                 X_te_t = X_test.copy()
@@ -256,8 +245,8 @@ def main():
                     if n_unique < 50:
                         sel_cats.append(col_name)
 
-            tr_pool = Pool(X_tr_t, y_smooth[tr_idx], cat_features=sel_cats)
-            va_pool = Pool(X_va_t, y_smooth[val_idx], cat_features=sel_cats)
+            tr_pool = Pool(X_tr_t, y[tr_idx], cat_features=sel_cats)
+            va_pool = Pool(X_va_t, y[val_idx], cat_features=sel_cats)
             te_pool = Pool(X_te_t, cat_features=sel_cats)
 
             cb = CatBoostClassifier(**params)
@@ -270,14 +259,15 @@ def main():
             model_path = MODELS_DIR / f"{col}_fold{fold_idx}.cbm"
             cb.save_model(str(model_path))
 
-            # Accumulate feature importances (scatter back to full array)
+            # Accumulate feature importances (scatter back to full array, base features only)
             imp = cb.get_feature_importance()
             if col in per_target_feats:
                 for j, sc in enumerate(sel_cols):
                     if sc in feature_cols:
                         importance_sum[feature_cols.index(sc), i] += imp[j]
             else:
-                importance_sum[:, i] += imp
+                # Only accumulate importance for base features (exclude OOF columns)
+                importance_sum[:, i] += imp[:len(feature_cols)]
 
             del cb, tr_pool, va_pool, te_pool; gc.collect()
             if (i + 1) % 10 == 0 or i == n_targets - 1:

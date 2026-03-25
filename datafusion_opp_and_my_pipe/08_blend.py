@@ -142,10 +142,8 @@ def optimize_per_target(oof_ranks, y, target_cols, n_models, step=0.10, fine_ste
 
 def main():
     t0 = time.time()
-    model_names = ["NN", "TabR", "LGBM", "XGBoost", "PyBoost", "CatBoost", "LGBM_meta"]
-    n_models = len(model_names)
     print("=" * 60)
-    print(f"Step 8: Rank per-target blend ({' + '.join(model_names)})")
+    print("Step 8: Rank per-target blend")
     print("=" * 60)
 
     # Load targets
@@ -153,53 +151,64 @@ def main():
     target_cols = [c for c in train_tgt.columns if c.startswith("target_")]
     y = train_tgt.select(target_cols).to_numpy().astype(np.float32)
 
-    # Load predictions
+    # Load predictions — build model list dynamically (TabR is optional)
     print("\n[1/3] Loading predictions...")
+    model_names = []
+    oof_list, test_list = [], []
+
     oof_nn, test_nn = load_nn()
     nn_auc, _ = compute_macro_auc(y, oof_nn, target_cols)
     print(f"  NN: OOF {nn_auc:.5f}")
+    model_names.append("NN"); oof_list.append(oof_nn); test_list.append(test_nn)
 
-    # TabR available but optional
-    try:
-        d = np.load("checkpoints_tabr/tabr_predictions.npz")
+    # TabR: include only if actually trained (no NN-duplicate fallback)
+    tabr_path = Path("checkpoints_tabr/tabr_predictions.npz")
+    if tabr_path.exists():
+        d = np.load(str(tabr_path))
         oof_tabr, test_tabr = d["oof_preds"], d["test_preds"]
         tabr_auc, _ = compute_macro_auc(y, oof_tabr, target_cols)
         print(f"  TabR: OOF {tabr_auc:.5f}")
-    except FileNotFoundError:
-        print(f"  TabR: not found (step 02b not completed)")
-        oof_tabr, test_tabr = oof_nn, test_nn  # Use NN as fallback
+        model_names.append("TabR"); oof_list.append(oof_tabr); test_list.append(test_tabr)
+    else:
+        print(f"  TabR: not found, skipping (6-model blend)")
 
     d = np.load("checkpoints_lgbm/lgbm_predictions.npz")
     oof_lgbm, test_lgbm = d["oof_preds"], d["test_preds"]
     lgbm_auc, _ = compute_macro_auc(y, oof_lgbm, target_cols)
     print(f"  LGBM: OOF {lgbm_auc:.5f}")
+    model_names.append("LGBM"); oof_list.append(oof_lgbm); test_list.append(test_lgbm)
 
     d = np.load("checkpoints_xgboost/xgb_predictions.npz")
     oof_xgb, test_xgb = d["oof_preds"], d["test_preds"]
     xgb_auc, _ = compute_macro_auc(y, oof_xgb, target_cols)
     print(f"  XGBoost: OOF {xgb_auc:.5f}")
+    model_names.append("XGBoost"); oof_list.append(oof_xgb); test_list.append(test_xgb)
 
     d = np.load("checkpoints_pyboost/pyboost_predictions.npz")
     oof_pb, test_pb = d["oof_preds"], d["test_preds"]
     pb_auc, _ = compute_macro_auc(y, oof_pb, target_cols)
     print(f"  PyBoost: OOF {pb_auc:.5f}")
+    model_names.append("PyBoost"); oof_list.append(oof_pb); test_list.append(test_pb)
 
     d = np.load("checkpoints_catboost/cb_predictions.npz")
     oof_cb, test_cb = d["oof_preds"], d["test_preds"]
     cb_auc, _ = compute_macro_auc(y, oof_cb, target_cols)
     print(f"  CatBoost: OOF {cb_auc:.5f}")
+    model_names.append("CatBoost"); oof_list.append(oof_cb); test_list.append(test_cb)
 
     d = np.load("checkpoints_lgbm_meta/lgbm_predictions.npz")
     oof_lgbm_meta, test_lgbm_meta = d["oof_preds"], d["test_preds"]
     lgbm_meta_auc, _ = compute_macro_auc(y, oof_lgbm_meta, target_cols)
     print(f"  LGBM_meta: OOF {lgbm_meta_auc:.5f}")
+    model_names.append("LGBM_meta"); oof_list.append(oof_lgbm_meta); test_list.append(test_lgbm_meta)
+
+    n_models = len(model_names)
+    print(f"\n  Total models: {n_models} ({', '.join(model_names)})")
 
     # Rank per-target optimization: coarse grid (step=0.10) + fine hill climbing (step=0.01)
     print(f"\n[2/3] Optimizing per-target weights ({n_models} models, coarse step=0.10 + fine hill climbing step=0.01)...")
-    oof_ranks = [to_ranks(oof_nn), to_ranks(oof_tabr), to_ranks(oof_lgbm), to_ranks(oof_xgb),
-                 to_ranks(oof_pb), to_ranks(oof_cb), to_ranks(oof_lgbm_meta)]
-    test_ranks = [to_ranks(test_nn), to_ranks(test_tabr), to_ranks(test_lgbm), to_ranks(test_xgb),
-                  to_ranks(test_pb), to_ranks(test_cb), to_ranks(test_lgbm_meta)]
+    oof_ranks = [to_ranks(oof) for oof in oof_list]
+    test_ranks = [to_ranks(test) for test in test_list]
 
     weights = optimize_per_target(oof_ranks, y, target_cols, n_models, step=0.10, fine_step=0.01)
 
@@ -233,17 +242,21 @@ def main():
     submit.write_parquet("submissions/blend.parquet")
     print(f"  Saved: submissions/blend.parquet")
 
-    # Save artifacts for stacking
+    # Save artifacts for stacking (always include TabR keys for compatibility)
     Path("blend_artifacts").mkdir(exist_ok=True)
-    np.savez_compressed("blend_artifacts/blend_data.npz",
-                        oof_nn=oof_nn, test_nn=test_nn,
-                        oof_tabr=oof_tabr, test_tabr=test_tabr,
-                        oof_lgbm=oof_lgbm, test_lgbm=test_lgbm,
-                        oof_xgb=oof_xgb, test_xgb=test_xgb,
-                        oof_pb=oof_pb, test_pb=test_pb,
-                        oof_cb=oof_cb, test_cb=test_cb,
-                        oof_lgbm_meta=oof_lgbm_meta, test_lgbm_meta=test_lgbm_meta,
-                        weights=weights)
+    save_dict = dict(
+        oof_nn=oof_nn, test_nn=test_nn,
+        oof_lgbm=oof_lgbm, test_lgbm=test_lgbm,
+        oof_xgb=oof_xgb, test_xgb=test_xgb,
+        oof_pb=oof_pb, test_pb=test_pb,
+        oof_cb=oof_cb, test_cb=test_cb,
+        oof_lgbm_meta=oof_lgbm_meta, test_lgbm_meta=test_lgbm_meta,
+        weights=weights,
+    )
+    if "TabR" in model_names:
+        save_dict["oof_tabr"] = oof_list[model_names.index("TabR")]
+        save_dict["test_tabr"] = test_list[model_names.index("TabR")]
+    np.savez_compressed("blend_artifacts/blend_data.npz", **save_dict)
 
     print(f"\nDone in {time.time()-t0:.1f}s. Blend OOF={blend_auc:.5f}")
 

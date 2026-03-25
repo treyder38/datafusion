@@ -56,37 +56,6 @@ LGBM_PARAMS = dict(
 EARLY_STOPPING_ROUNDS = 100
 
 
-def focal_loss_objective(y_pred, y_true):
-    """Focal loss for LightGBM: focuses on hard negatives.
-
-    Reduces importance of easy negatives (high confidence predictions of negative class).
-    gamma=2.0 balances between down-weighting easy samples and focusing on hard ones.
-    """
-    from scipy.special import expit  # sigmoid
-    y_pred_prob = expit(y_pred)
-
-    gamma = 2.0
-    epsilon = 1e-7
-
-    # Clip to avoid log(0)
-    y_pred_prob = np.clip(y_pred_prob, epsilon, 1 - epsilon)
-
-    # Gradient and hessian
-    p = y_pred_prob
-    grad = np.where(
-        y_true == 1,
-        -(1 - p) ** gamma,           # positive class
-        p ** gamma                    # negative class (down-weighted)
-    )
-
-    hess = np.where(
-        y_true == 1,
-        gamma * (1 - p) ** (gamma - 1) * p * (1 - p),
-        -gamma * p ** (gamma - 1) * (1 - p) * p
-    )
-
-    return grad, hess
-
 
 def get_rarity_tier_params(n_pos):
     """Get hyperparameter tier based on number of positive samples.
@@ -161,10 +130,6 @@ def _train_one_target(target_idx, target_name, fold_idx, threads,
             params["n_estimators"] = 3500
             early_stop = 300
 
-    # Note: Focal loss via custom objective not used in sklearn wrapper
-    # (would require lgb.train() API). Instead, rarity-tier hyperparameters and
-    # scale_pos_weight handle imbalance for rare targets (pos_rate < 5%).
-
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         model = lgb.LGBMClassifier(**params)
@@ -183,6 +148,7 @@ def _train_one_target(target_idx, target_name, fold_idx, threads,
     test_preds = model.predict_proba(X_test)[:, 1]
     model.booster_.save_model(str(MODELS_DIR / f"{target_name}_fold{fold_idx}.lgb"))
     importance = model.booster_.feature_importance(importance_type="gain")
+    importance = importance[:n_base_features]  # exclude OOF cols from importance tracking
 
     return val_preds, test_preds, importance
 
@@ -252,8 +218,8 @@ def main():
     kf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     print(f"\n[2/4] Training {N_FOLDS}-Fold × {n_targets} targets...", flush=True)
 
-    # Track OOF feature columns for masking
-    n_base_features = len(feature_cols) if not has_oof_features else len(feature_cols)
+    # Number of base features (without OOF columns) — used for masking and importance
+    n_base_features = len(feature_cols)
     fold_aucs_per_target = {}  # Track per-target AUC from fold 1 for difficulty override
 
     for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(np.arange(n_train), y_train)):

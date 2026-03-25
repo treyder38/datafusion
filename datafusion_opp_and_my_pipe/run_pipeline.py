@@ -113,7 +113,7 @@ STEPS = [
         label="Blend",
         script="08_blend.py",
         outputs=("blend_artifacts/blend_data.npz", "submissions/blend.parquet"),
-        depends_on=("nn", "tabr", "lgbm", "xgboost", "pyboost", "catboost", "lgbm_meta"),
+        depends_on=("nn", "lgbm", "xgboost", "pyboost", "catboost", "lgbm_meta"),
     ),
     Step(
         key="stacking",
