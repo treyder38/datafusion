@@ -108,6 +108,13 @@ STEPS = [
         outputs=("submissions/stacking.parquet",),
         depends_on=("blend",),
     ),
+    Step(
+        key="pseudo_label",
+        label="Pseudo-labeling",
+        script="10_pseudo_label.py",
+        outputs=("submissions/pseudo_labeled.parquet",),
+        depends_on=("stacking",),
+    ),
 ]
 
 STEP_BY_KEY = {step.key: step for step in STEPS}
