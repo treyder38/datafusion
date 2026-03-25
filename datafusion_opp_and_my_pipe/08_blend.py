@@ -1,6 +1,6 @@
-"""Step 8: Rank per-target blend (NN + LGBM + XGBoost + PyBoost + CatBoost + LGBM meta).
+"""Step 8: Rank per-target blend (NN + TabR + LGBM + XGBoost + PyBoost + CatBoost + LGBM meta).
 
-Per-target weight optimization on OOF via grid search (6 models).
+Per-target weight optimization on OOF via grid search (7 models, TabR optional).
 
 Output: submissions/blend.parquet
 
@@ -78,7 +78,7 @@ def optimize_per_target(oof_ranks, y, target_cols, n_models, step=0.10):
 
 def main():
     t0 = time.time()
-    model_names = ["NN", "LGBM", "XGBoost", "PyBoost", "CatBoost", "LGBM_meta"]
+    model_names = ["NN", "TabR", "LGBM", "XGBoost", "PyBoost", "CatBoost", "LGBM_meta"]
     n_models = len(model_names)
     print("=" * 60)
     print(f"Step 8: Rank per-target blend ({' + '.join(model_names)})")
@@ -94,6 +94,16 @@ def main():
     oof_nn, test_nn = load_nn()
     nn_auc, _ = compute_macro_auc(y, oof_nn, target_cols)
     print(f"  NN: OOF {nn_auc:.5f}")
+
+    # TabR available but optional
+    try:
+        d = np.load("checkpoints_tabr/tabr_predictions.npz")
+        oof_tabr, test_tabr = d["oof_preds"], d["test_preds"]
+        tabr_auc, _ = compute_macro_auc(y, oof_tabr, target_cols)
+        print(f"  TabR: OOF {tabr_auc:.5f}")
+    except FileNotFoundError:
+        print(f"  TabR: not found (step 02b not completed)")
+        oof_tabr, test_tabr = oof_nn, test_nn  # Use NN as fallback
 
     d = np.load("checkpoints_lgbm/lgbm_predictions.npz")
     oof_lgbm, test_lgbm = d["oof_preds"], d["test_preds"]
@@ -122,9 +132,9 @@ def main():
 
     # Rank per-target optimization
     print(f"\n[2/3] Optimizing per-target weights ({n_models} models, step=0.10)...")
-    oof_ranks = [to_ranks(oof_nn), to_ranks(oof_lgbm), to_ranks(oof_xgb),
+    oof_ranks = [to_ranks(oof_nn), to_ranks(oof_tabr), to_ranks(oof_lgbm), to_ranks(oof_xgb),
                  to_ranks(oof_pb), to_ranks(oof_cb), to_ranks(oof_lgbm_meta)]
-    test_ranks = [to_ranks(test_nn), to_ranks(test_lgbm), to_ranks(test_xgb),
+    test_ranks = [to_ranks(test_nn), to_ranks(test_tabr), to_ranks(test_lgbm), to_ranks(test_xgb),
                   to_ranks(test_pb), to_ranks(test_cb), to_ranks(test_lgbm_meta)]
 
     weights = optimize_per_target(oof_ranks, y, target_cols, n_models, step=0.10)
@@ -163,6 +173,7 @@ def main():
     Path("blend_artifacts").mkdir(exist_ok=True)
     np.savez_compressed("blend_artifacts/blend_data.npz",
                         oof_nn=oof_nn, test_nn=test_nn,
+                        oof_tabr=oof_tabr, test_tabr=test_tabr,
                         oof_lgbm=oof_lgbm, test_lgbm=test_lgbm,
                         oof_xgb=oof_xgb, test_xgb=test_xgb,
                         oof_pb=oof_pb, test_pb=test_pb,
