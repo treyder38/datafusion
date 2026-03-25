@@ -51,6 +51,48 @@ XGB_PARAMS = dict(
 )
 EARLY_STOPPING_ROUNDS = 100
 
+# Rarity-tier hyperparameters based on positive rate
+def get_rarity_tier_params(n_pos):
+    """Get HP tier based on number of positive samples."""
+    if n_pos < 500:  # Ultra-rare
+        return {"learning_rate": 0.02, "max_depth": 6, "n_estimators": 2000, "early_stopping": 300}
+    elif n_pos < 2000:  # Rare
+        return {"learning_rate": 0.03, "max_depth": 7, "n_estimators": 1800, "early_stopping": 200}
+    elif n_pos < 10000:  # Moderate
+        return {"learning_rate": 0.04, "max_depth": 7, "n_estimators": 1600, "early_stopping": 150}
+    else:  # Common/Abundant
+        return None  # Use default Optuna-tuned params
+
+
+def focal_loss_objective(y_pred, y_true):
+    """Focal loss for XGBoost: focuses on hard negatives."""
+    from scipy.special import expit  # sigmoid
+    y_pred_prob = expit(y_pred)
+
+    # Focal loss: -alpha * (1-p)^gamma * log(p) for y=1, -alpha * p^gamma * log(1-p) for y=0
+    # Simplified: down-weight easy negatives with gamma=2
+    gamma = 2.0
+    epsilon = 1e-7
+
+    # Clip predictions to avoid log(0)
+    y_pred_prob = np.clip(y_pred_prob, epsilon, 1 - epsilon)
+
+    # Gradient and hessian for focal loss
+    p = y_pred_prob
+    grad = np.where(
+        y_true == 1,
+        -(1 - p) ** gamma,  # positive class
+        p ** gamma  # negative class (down-weighted)
+    )
+
+    hess = np.where(
+        y_true == 1,
+        gamma * (1 - p) ** (gamma - 1) * p * (1 - p),
+        -gamma * p ** (gamma - 1) * (1 - p) * p
+    )
+
+    return grad, hess
+
 
 def load_xgb_params():
     """Load best params from Optuna tuning, fall back to defaults."""
@@ -70,15 +112,39 @@ def load_xgb_params():
 
 def _train_one_target(target_idx, target_name, fold_idx, threads,
                       X_tr, y_tr, X_val, y_val, X_test,
-                      xgb_params):
+                      xgb_params, fold_aucs_per_target=None):
     """Train a single target — runs in a thread (XGBoost releases GIL)."""
     y_t = y_tr[:, target_idx]
     n_neg = int((y_t == 0).sum())
     n_pos = int((y_t == 1).sum())
+    pos_rate = n_pos / (n_pos + n_neg)
+
     spw = effective_number_weight(n_pos, n_neg)
     params = {**xgb_params, "nthread": threads, "scale_pos_weight": spw}
 
-    model = xgb.XGBClassifier(**params)
+    # Apply rarity-tier HP
+    tier_params = get_rarity_tier_params(n_pos)
+    if tier_params is not None:
+        params["learning_rate"] = tier_params["learning_rate"]
+        params["max_depth"] = tier_params["max_depth"]
+        params["n_estimators"] = tier_params["n_estimators"]
+        early_stop = tier_params["early_stopping"]
+    else:
+        early_stop = EARLY_STOPPING_ROUNDS
+
+    # Difficulty override: after fold 1, if AUC < 0.73, use aggressive HP
+    if fold_idx > 0 and fold_aucs_per_target is not None and target_idx in fold_aucs_per_target:
+        target_auc = fold_aucs_per_target[target_idx]
+        if target_auc < 0.73:
+            params["learning_rate"] = 0.02
+            params["n_estimators"] = 3500
+            early_stop = 300
+
+    # Use focal loss for rare targets (pos_rate < 5%)
+    if pos_rate < 0.05:
+        params["objective"] = focal_loss_objective
+
+    model = xgb.XGBClassifier(**params, early_stopping_rounds=early_stop)
     model.fit(
         X_tr, y_tr[:, target_idx],
         eval_set=[(X_val, y_val[:, target_idx])],
@@ -141,6 +207,8 @@ def main():
     kf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     print(f"\n[2/4] Training {N_FOLDS}-Fold × {n_targets} targets...", flush=True)
 
+    fold_aucs_per_target = {}  # Track per-target AUC from fold 1 for difficulty override
+
     for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(np.arange(n_train), y_train)):
         t_fold = time.time()
         print(f"\n  ── Fold {fold_idx+1}/{N_FOLDS} "
@@ -158,7 +226,7 @@ def main():
                 futures[executor.submit(
                     _train_one_target, i, col, fold_idx, THREADS_PER_MODEL,
                     X_tr, y_tr, X_val, y_val, X_test,
-                    xgb_params,
+                    xgb_params, fold_aucs_per_target,
                 )] = i
 
             done_count = 0
@@ -171,6 +239,10 @@ def main():
                 done_count += 1
                 if done_count % 10 == 0 or done_count == n_targets:
                     print(f"    {done_count}/{n_targets} targets done", flush=True)
+
+        # Compute per-target AUC for difficulty override in next fold
+        _, per_target_aucs = compute_macro_auc(y_val, oof_preds[val_idx], target_cols)
+        fold_aucs_per_target = {i: per_target_aucs[target_cols[i]] for i in range(n_targets)}
 
         fold_auc, _ = compute_macro_auc(y_val, oof_preds[val_idx], target_cols)
         test_preds_sum += fold_test_preds

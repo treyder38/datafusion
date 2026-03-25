@@ -56,6 +56,56 @@ LGBM_PARAMS = dict(
 EARLY_STOPPING_ROUNDS = 100
 
 
+def focal_loss_objective(y_pred, y_true):
+    """Focal loss for LightGBM: focuses on hard negatives.
+
+    Reduces importance of easy negatives (high confidence predictions of negative class).
+    gamma=2.0 balances between down-weighting easy samples and focusing on hard ones.
+    """
+    from scipy.special import expit  # sigmoid
+    y_pred_prob = expit(y_pred)
+
+    gamma = 2.0
+    epsilon = 1e-7
+
+    # Clip to avoid log(0)
+    y_pred_prob = np.clip(y_pred_prob, epsilon, 1 - epsilon)
+
+    # Gradient and hessian
+    p = y_pred_prob
+    grad = np.where(
+        y_true == 1,
+        -(1 - p) ** gamma,           # positive class
+        p ** gamma                    # negative class (down-weighted)
+    )
+
+    hess = np.where(
+        y_true == 1,
+        gamma * (1 - p) ** (gamma - 1) * p * (1 - p),
+        -gamma * p ** (gamma - 1) * (1 - p) * p
+    )
+
+    return grad, hess
+
+
+def get_rarity_tier_params(n_pos):
+    """Get hyperparameter tier based on number of positive samples.
+
+    Rarer targets (fewer positives) need:
+    - Slower learning rate to avoid overfitting/overshooting weak signal
+    - Shallower trees to reduce variance
+    - More iterations to compensate for smaller steps
+    """
+    if n_pos < 500:  # Ultra-rare
+        return {"learning_rate": 0.02, "max_depth": 6, "n_estimators": 2000, "early_stopping": 300}
+    elif n_pos < 2000:  # Rare
+        return {"learning_rate": 0.03, "max_depth": 7, "n_estimators": 1800, "early_stopping": 200}
+    elif n_pos < 10000:  # Moderate
+        return {"learning_rate": 0.04, "max_depth": 7, "n_estimators": 1600, "early_stopping": 150}
+    else:  # Common/Abundant
+        return None  # Use default Optuna-tuned params
+
+
 def load_lgbm_params():
     """Load best params from Optuna tuning, fall back to defaults."""
     params = dict(LGBM_PARAMS)
@@ -75,13 +125,36 @@ def load_lgbm_params():
 def _train_one_target(target_idx, target_name, fold_idx, threads,
                       cat_indices, supports_cat, device_params,
                       X_tr, y_tr, X_val, y_val, X_test,
-                      lgbm_params):
+                      lgbm_params, fold_aucs_per_target=None):
     """Train a single target — runs in a thread (GIL released by LightGBM C++)."""
     y_t = y_tr[:, target_idx]
     n_neg = int((y_t == 0).sum())
     n_pos = int((y_t == 1).sum())
+    pos_rate = n_pos / (n_pos + n_neg)
+
     spw = effective_number_weight(n_pos, n_neg)
     params = {**lgbm_params, "n_jobs": threads, "scale_pos_weight": spw, **device_params}
+
+    # Apply rarity-tier hyperparameters based on positive sample count
+    tier_params = get_rarity_tier_params(n_pos)
+    early_stop = EARLY_STOPPING_ROUNDS
+    if tier_params is not None:
+        params["learning_rate"] = tier_params["learning_rate"]
+        params["max_depth"] = tier_params["max_depth"]
+        params["n_estimators"] = tier_params["n_estimators"]
+        early_stop = tier_params["early_stopping"]
+
+    # Difficulty override: after fold 1, if AUC < 0.73, use aggressive hyperparameters
+    if fold_idx > 0 and fold_aucs_per_target is not None and target_idx in fold_aucs_per_target:
+        target_auc = fold_aucs_per_target[target_idx]
+        if target_auc < 0.73:
+            params["learning_rate"] = 0.02
+            params["n_estimators"] = 3500
+            early_stop = 300
+
+    # Note: Focal loss via custom objective not used in sklearn wrapper
+    # (would require lgb.train() API). Instead, rarity-tier hyperparameters and
+    # scale_pos_weight handle imbalance for rare targets (pos_rate < 5%).
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
@@ -91,7 +164,7 @@ def _train_one_target(target_idx, target_name, fold_idx, threads,
             eval_set=[(X_val, y_val[:, target_idx])],
             eval_metric="auc",
             callbacks=[
-                lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False),
+                lgb.early_stopping(early_stop, verbose=False),
                 lgb.log_evaluation(period=0),
             ],
             categorical_feature=cat_indices if supports_cat else "auto",
@@ -157,6 +230,8 @@ def main():
     kf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     print(f"\n[2/4] Training {N_FOLDS}-Fold × {n_targets} targets...", flush=True)
 
+    fold_aucs_per_target = {}  # Track per-target AUC from fold 1 for difficulty override
+
     for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(np.arange(n_train), y_train)):
         t_fold = time.time()
         print(f"\n  ── Fold {fold_idx+1}/{N_FOLDS} "
@@ -177,7 +252,7 @@ def main():
                     _train_one_target, i, col, fold_idx, THREADS_PER_MODEL,
                     cat_indices, supports_cat, device_params,
                     X_tr, y_tr, X_val, y_val, X_test,
-                    lgbm_params,
+                    lgbm_params, fold_aucs_per_target,
                 )] = i
 
             done_count = 0
@@ -190,6 +265,10 @@ def main():
                 done_count += 1
                 if done_count % 10 == 0 or done_count == n_targets:
                     print(f"    {done_count}/{n_targets} targets done", flush=True)
+
+        # Compute per-target AUC for difficulty override in next fold
+        _, per_target_aucs = compute_macro_auc(y_val, oof_preds[val_idx], target_cols)
+        fold_aucs_per_target = {i: per_target_aucs[target_cols[i]] for i in range(n_targets)}
 
         fold_auc, _ = compute_macro_auc(y_val, oof_preds[val_idx], target_cols)
         test_preds_sum += fold_test_preds

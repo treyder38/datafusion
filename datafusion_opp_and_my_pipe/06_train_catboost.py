@@ -64,6 +64,24 @@ def load_cb_params():
     return base
 
 
+def get_rarity_tier_params(n_pos):
+    """Get hyperparameter tier based on number of positive samples.
+
+    Rarer targets (fewer positives) need:
+    - Slower learning rate to avoid overfitting/overshooting weak signal
+    - Shallower trees to reduce variance
+    - More iterations to compensate for smaller steps
+    """
+    if n_pos < 500:  # Ultra-rare
+        return {"learning_rate": 0.02, "max_depth": 6, "iterations": 2000, "early_stopping_rounds": 300}
+    elif n_pos < 2000:  # Rare
+        return {"learning_rate": 0.03, "max_depth": 7, "iterations": 1800, "early_stopping_rounds": 200}
+    elif n_pos < 10000:  # Moderate
+        return {"learning_rate": 0.04, "max_depth": 7, "iterations": 1600, "early_stopping_rounds": 150}
+    else:  # Common/Abundant
+        return None  # Use default Optuna-tuned params
+
+
 def detect_task_type():
     """Detect GPU availability for CatBoost."""
     try:
@@ -147,6 +165,8 @@ def main():
     kf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     print(f"\n[2/4] Training {N_FOLDS}-Fold x {n_targets} targets...", flush=True)
 
+    fold_aucs_per_target = {}  # Track per-target AUC from fold 1 for difficulty override
+
     for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(np.arange(n_train), y_train)):
         t_fold = time.time()
         print(f"\n  -- Fold {fold_idx+1}/{N_FOLDS} "
@@ -156,6 +176,7 @@ def main():
 
         for i, col in enumerate(target_cols):
             y = y_train[:, i]
+            n_pos = int((y[tr_idx] == 1).sum())
 
             params = dict(cb_params)
             params["random_seed"] = SEED + fold_idx
@@ -163,6 +184,22 @@ def main():
             if task_type == "GPU":
                 params["task_type"] = "GPU"
                 params["devices"] = devices
+
+            # Apply rarity-tier hyperparameters based on positive sample count
+            tier_params = get_rarity_tier_params(n_pos)
+            if tier_params is not None:
+                params["learning_rate"] = tier_params["learning_rate"]
+                params["max_depth"] = tier_params["max_depth"]
+                params["iterations"] = tier_params["iterations"]
+                params["early_stopping_rounds"] = tier_params["early_stopping_rounds"]
+
+            # Difficulty override: after fold 1, if AUC < 0.73, use aggressive hyperparameters
+            if fold_idx > 0 and i in fold_aucs_per_target:
+                target_auc = fold_aucs_per_target[i]
+                if target_auc < 0.73:
+                    params["learning_rate"] = 0.02
+                    params["iterations"] = 3500
+                    params["early_stopping_rounds"] = 300
 
             # Per-target feature selection
             if col in per_target_feats:
@@ -212,6 +249,10 @@ def main():
             del cb, tr_pool, va_pool, te_pool; gc.collect()
             if (i + 1) % 10 == 0 or i == n_targets - 1:
                 print(f"    {i+1}/{n_targets} targets done", flush=True)
+
+        # Compute per-target AUC for difficulty override in next fold
+        _, per_target_aucs = compute_macro_auc(y_train[val_idx], oof_preds[val_idx], target_cols)
+        fold_aucs_per_target = {i: per_target_aucs[target_cols[i]] for i in range(n_targets)}
 
         fold_auc, _ = compute_macro_auc(y_train[val_idx], oof_preds[val_idx], target_cols)
         test_preds_sum += fold_test_preds
