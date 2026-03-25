@@ -178,6 +178,14 @@ def main():
                 X_va_t = X_train.iloc[val_idx]
                 X_te_t = X_test
 
+            # Detect pseudo-categorical numeric features (nunique < 50)
+            # CatBoost uses Ordered Target Statistics for categoricals — superior to threshold splits
+            for col_name in sel_cols:
+                if col_name not in sel_cats:  # Only check numeric features
+                    n_unique = X_tr_t[col_name].nunique()
+                    if n_unique < 50:
+                        sel_cats.append(col_name)
+
             tr_pool = Pool(X_tr_t, y[tr_idx], cat_features=sel_cats)
             va_pool = Pool(X_va_t, y[val_idx], cat_features=sel_cats)
             te_pool = Pool(X_te_t, cat_features=sel_cats)
