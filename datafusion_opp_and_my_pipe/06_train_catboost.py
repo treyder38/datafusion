@@ -82,6 +82,15 @@ def get_rarity_tier_params(n_pos):
         return None  # Use default Optuna-tuned params
 
 
+def apply_label_smoothing(y, epsilon=0.05):
+    """Apply label smoothing to binary targets.
+
+    Smooths hard labels {0, 1} toward center {epsilon, 1-epsilon}.
+    This encourages calibrated probability predictions and prevents overconfident models.
+    """
+    return epsilon + (1 - 2 * epsilon) * y
+
+
 def detect_task_type():
     """Detect GPU availability for CatBoost."""
     try:
@@ -178,6 +187,9 @@ def main():
             y = y_train[:, i]
             n_pos = int((y[tr_idx] == 1).sum())
 
+            # Apply label smoothing to prevent overconfident predictions
+            y_smooth = apply_label_smoothing(y, epsilon=0.05)
+
             params = dict(cb_params)
             params["random_seed"] = SEED + fold_idx
             params["auto_class_weights"] = "Balanced"
@@ -223,8 +235,8 @@ def main():
                     if n_unique < 50:
                         sel_cats.append(col_name)
 
-            tr_pool = Pool(X_tr_t, y[tr_idx], cat_features=sel_cats)
-            va_pool = Pool(X_va_t, y[val_idx], cat_features=sel_cats)
+            tr_pool = Pool(X_tr_t, y_smooth[tr_idx], cat_features=sel_cats)
+            va_pool = Pool(X_va_t, y_smooth[val_idx], cat_features=sel_cats)
             te_pool = Pool(X_te_t, cat_features=sel_cats)
 
             cb = CatBoostClassifier(**params)
