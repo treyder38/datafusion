@@ -60,6 +60,13 @@ STEPS = [
         depends_on=("fe",),
     ),
     Step(
+        key="tabr",
+        label="TabR (retrieval-based NN)",
+        script="02b_train_tabr.py",
+        outputs=("checkpoints_tabr/tabr_predictions.npz",),
+        depends_on=("fe",),
+    ),
+    Step(
         key="lgbm",
         label="LightGBM",
         script="03_train_lgbm.py",
@@ -99,7 +106,7 @@ STEPS = [
         label="Blend",
         script="08_blend.py",
         outputs=("blend_artifacts/blend_data.npz", "submissions/blend.parquet"),
-        depends_on=("nn", "lgbm", "xgboost", "pyboost", "catboost", "lgbm_meta"),
+        depends_on=("nn", "tabr", "lgbm", "xgboost", "pyboost", "catboost", "lgbm_meta"),
     ),
     Step(
         key="stacking",
