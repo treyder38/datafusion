@@ -19,7 +19,7 @@ import polars as pl
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc
+from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc, effective_number_weight
 
 FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_pyboost")
@@ -39,6 +39,32 @@ PARAMS = dict(
     gd_steps=1,
     use_hess=False,
 )
+
+
+def compute_sample_weights(y_train, target_cols):
+    """Compute per-sample weights based on target-level class imbalance.
+
+    For multi-output learning, we compute effective number weights per target,
+    then average across targets to get a single sample weight vector.
+    This accounts for the fact that some samples belong to rare classes.
+    """
+    n_samples = y_train.shape[0]
+    sample_weights = np.ones(n_samples, dtype=np.float32)
+
+    for target_idx, target_name in enumerate(target_cols):
+        y_t = y_train[:, target_idx]
+        n_neg = (y_t == 0).sum()
+        n_pos = (y_t == 1).sum()
+
+        # Compute effective number weight per target
+        if n_pos > 0 and n_neg > 0:
+            eff_weight = effective_number_weight(int(n_pos), int(n_neg))
+            # Weight positive samples more (class weight imbalance)
+            sample_weights[y_t == 1] += (eff_weight - 1.0) / len(target_cols)
+
+    # Normalize so mean is 1.0
+    sample_weights = sample_weights / sample_weights.mean()
+    return sample_weights
 
 
 def main():
@@ -94,6 +120,11 @@ def main():
 
     # 3. Train
     print(f"\n[2/4] Training SketchBoost {N_FOLDS}-fold...")
+
+    # Compute sample weights based on target-level class imbalance
+    sample_weights_all = compute_sample_weights(y, target_cols)
+    print(f"  Sample weights computed (mean={sample_weights_all.mean():.4f}, std={sample_weights_all.std():.4f})")
+
     mskf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     oof_preds = np.zeros_like(y, dtype=np.float64)
     test_preds = np.zeros((X_test.shape[0], len(target_cols)), dtype=np.float64)
@@ -106,9 +137,10 @@ def main():
 
         X_tr, X_val = X_train[tr_idx], X_train[val_idx]
         y_tr, y_val = y[tr_idx], y[val_idx]
+        sample_weights_tr = sample_weights_all[tr_idx]
 
         model = SketchBoost('bce', **PARAMS)
-        model.fit(X_tr, y_tr, eval_sets=[{'X': X_val, 'y': y_val}])
+        model.fit(X_tr, y_tr, sample_weight=sample_weights_tr, eval_sets=[{'X': X_val, 'y': y_val}])
 
         val_raw = model.predict(X_val)
         test_raw = model.predict(X_test)
