@@ -52,27 +52,91 @@ def _gen_weight_combos(n_models, step):
     return _recurse(0, 1.0)
 
 
-def optimize_per_target(oof_ranks, y, target_cols, n_models, step=0.10):
-    """Per-target weight optimization for N-model rank blend."""
+def _hill_climbing_optimize(oof_ranks_i, y_t, n_models, initial_w, fine_step=0.01):
+    """Hill climbing optimization for a single target.
+
+    Starts with initial_w and greedily explores neighboring solutions by adjusting
+    each weight in {-step, 0, +step} increments. Converges when no improvement found.
+    """
+    best_w = np.array(initial_w, dtype=np.float32)
+    best_auc = roc_auc_score(y_t, oof_ranks_i @ best_w)
+
+    improved = True
+    iterations = 0
+    max_iterations = 50  # Prevent infinite loops
+
+    while improved and iterations < max_iterations:
+        iterations += 1
+        improved = False
+
+        # Try adjusting each weight
+        for i in range(n_models):
+            for delta in [-fine_step, fine_step]:
+                # Create candidate weight
+                cand_w = best_w.copy()
+                cand_w[i] += delta
+
+                # Normalize to sum to 1.0
+                total = cand_w.sum()
+                if total > 0:
+                    cand_w = cand_w / total
+                else:
+                    continue
+
+                # Check bounds
+                if np.any(cand_w < 0) or np.any(cand_w > 1):
+                    continue
+
+                # Evaluate
+                cand_auc = roc_auc_score(y_t, oof_ranks_i @ cand_w)
+
+                # Accept if better
+                if cand_auc > best_auc + 1e-6:  # Small epsilon to avoid floating point issues
+                    best_w = cand_w
+                    best_auc = cand_auc
+                    improved = True
+                    break  # Move to next weight dimension
+
+            if improved:
+                break  # Restart from new best solution
+
+    return best_w / best_w.sum()  # Ensure normalized
+
+
+def optimize_per_target(oof_ranks, y, target_cols, n_models, step=0.10, fine_step=0.01):
+    """Per-target weight optimization for N-model rank blend.
+
+    Uses coarse grid search (step=0.10) to find rough region, then hill climbing
+    with finer step (0.01) for precise local optimization.
+    """
     n_targets = len(target_cols)
-    default_w = [1.0 / n_models] * n_models
+    default_w = np.array([1.0 / n_models] * n_models)
     weights = np.zeros((n_targets, n_models))
-    # Precompute weight combos (shared across targets)
+
+    # Precompute coarse grid combos for initial search
     combos = list(_gen_weight_combos(n_models, step))
+
     for i in range(n_targets):
         y_t = y[:, i]
         if y_t.sum() < 2 or (len(y_t) - y_t.sum()) < 2:
             weights[i] = default_w
             continue
+
         ranks_i = np.column_stack([oof_ranks[m][:, i] for m in range(n_models)])
-        best_auc, best_w = 0.0, default_w[:]
+
+        # Phase 1: Coarse grid search to find rough region
+        best_auc, best_w = 0.0, default_w.copy()
         for combo in combos:
-            blended = ranks_i @ np.array(combo)
-            auc = roc_auc_score(y_t, blended)
+            combo_arr = np.array(combo)
+            auc = roc_auc_score(y_t, ranks_i @ combo_arr)
             if auc > best_auc:
                 best_auc = auc
-                best_w = list(combo)
+                best_w = combo_arr.copy()
+
+        # Phase 2: Fine hill climbing from best coarse solution
+        best_w = _hill_climbing_optimize(ranks_i, y_t, n_models, best_w, fine_step=fine_step)
         weights[i] = best_w
+
     return weights
 
 
@@ -130,14 +194,14 @@ def main():
     lgbm_meta_auc, _ = compute_macro_auc(y, oof_lgbm_meta, target_cols)
     print(f"  LGBM_meta: OOF {lgbm_meta_auc:.5f}")
 
-    # Rank per-target optimization
-    print(f"\n[2/3] Optimizing per-target weights ({n_models} models, step=0.10)...")
+    # Rank per-target optimization: coarse grid (step=0.10) + fine hill climbing (step=0.01)
+    print(f"\n[2/3] Optimizing per-target weights ({n_models} models, coarse step=0.10 + fine hill climbing step=0.01)...")
     oof_ranks = [to_ranks(oof_nn), to_ranks(oof_tabr), to_ranks(oof_lgbm), to_ranks(oof_xgb),
                  to_ranks(oof_pb), to_ranks(oof_cb), to_ranks(oof_lgbm_meta)]
     test_ranks = [to_ranks(test_nn), to_ranks(test_tabr), to_ranks(test_lgbm), to_ranks(test_xgb),
                   to_ranks(test_pb), to_ranks(test_cb), to_ranks(test_lgbm_meta)]
 
-    weights = optimize_per_target(oof_ranks, y, target_cols, n_models, step=0.10)
+    weights = optimize_per_target(oof_ranks, y, target_cols, n_models, step=0.10, fine_step=0.01)
 
     # Build blended predictions
     n_targets = len(target_cols)
