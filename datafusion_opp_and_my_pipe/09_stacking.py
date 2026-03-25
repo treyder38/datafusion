@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+from scipy.special import logit
 from scipy.stats import rankdata
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
@@ -30,6 +31,23 @@ from utils import (
 )
 
 N_META_FOLDS = 4
+
+
+def apply_logit_transform(*arrays):
+    """Apply logit transformation to probability arrays.
+
+    Logit maps [0, 1] → (-∞, +∞), making probability distributions more linear.
+    This helps tree-based meta-learners find better weight combinations.
+    Probabilities are clipped to [1e-6, 1-1e-6] to avoid infinities.
+    """
+    transformed = []
+    for arr in arrays:
+        # Clip to avoid infinities at boundaries
+        clipped = np.clip(arr, 1e-6, 1 - 1e-6)
+        # Apply logit: log(p / (1-p))
+        logit_arr = logit(clipped).astype(np.float32)
+        transformed.append(logit_arr)
+    return transformed
 
 
 def build_meta_features(*oof_arrays):
@@ -199,11 +217,16 @@ def main():
     baseline_auc, _ = compute_macro_auc(y, baseline_oof, target_cols)
     print(f"  Rank blend baseline: {baseline_auc:.4f}")
 
-    # Build meta-features (7 models)
-    print("\n[2/4] Building meta-features...")
-    X_meta_train = build_meta_features(oof_nn, oof_tabr, oof_lgbm, oof_xgb, oof_pb, oof_cb, oof_lgbm_meta)
-    X_meta_test = build_meta_features(test_nn, test_tabr, test_lgbm, test_xgb, test_pb, test_cb, test_lgbm_meta)
-    print(f"  Meta-features: {X_meta_train.shape[1]}")
+    # Build meta-features (7 models) with logit calibration
+    print("\n[2/4] Building meta-features with logit calibration...")
+    # Apply logit transformation to all OOF and test predictions
+    # This maps probabilities to wider range, helping tree-based meta-learners find better splits
+    oof_logit = apply_logit_transform(oof_nn, oof_tabr, oof_lgbm, oof_xgb, oof_pb, oof_cb, oof_lgbm_meta)
+    test_logit = apply_logit_transform(test_nn, test_tabr, test_lgbm, test_xgb, test_pb, test_cb, test_lgbm_meta)
+
+    X_meta_train = build_meta_features(*oof_logit)
+    X_meta_test = build_meta_features(*test_logit)
+    print(f"  Meta-features: {X_meta_train.shape[1]} (from logit-transformed probabilities)")
 
     # LGBM stacking
     print("\n[3/4] LGBM meta stacking...")
