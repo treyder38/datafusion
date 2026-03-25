@@ -1,6 +1,6 @@
-"""Step 9: Stacking — LGBM meta-learner + combo (6 models).
+"""Step 9: Stacking — LGBM meta-learner + combo (7 models including TabR).
 
-Meta-features: 6x41 base + C(6,2)x41 pairwise |diffs| + C(6,2)x41 pairwise prods + aggregates.
+Meta-features: 7x41 base + C(7,2)x41 pairwise |diffs| + C(7,2)x41 pairwise prods + aggregates.
 LGBM meta-learner trained with 4-fold OOF.
 Final combo: alpha * rank(meta) + (1-alpha) * rank(blend).
 
@@ -132,7 +132,7 @@ def optimize_rank_blend(oof_list, y, target_cols, n_models, step=0.10):
 
 def main():
     t0 = time.time()
-    model_names = ["NN", "LGBM", "XGBoost", "PyBoost", "CatBoost", "LGBM_meta"]
+    model_names = ["NN", "TabR", "LGBM", "XGBoost", "PyBoost", "CatBoost", "LGBM_meta"]
     n_models = len(model_names)
     print("=" * 60)
     print(f"Step 9: Stacking (LGBM meta + combo, {n_models} models)")
@@ -154,6 +154,16 @@ def main():
     d = np.load("blend_artifacts/blend_data.npz")
     oof_nn = d["oof_nn"].astype(np.float32)
     test_nn = d["test_nn"].astype(np.float32)
+
+    # TabR available but optional
+    if "oof_tabr" in d:
+        oof_tabr = d["oof_tabr"].astype(np.float32)
+        test_tabr = d["test_tabr"].astype(np.float32)
+    else:
+        # Fallback: use NN if TabR not available
+        oof_tabr = oof_nn
+        test_tabr = test_nn
+
     oof_lgbm = d["oof_lgbm"].astype(np.float32)
     test_lgbm = d["test_lgbm"].astype(np.float32)
     oof_xgb = d["oof_xgb"].astype(np.float32)
@@ -166,7 +176,7 @@ def main():
     test_lgbm_meta = d["test_lgbm_meta"].astype(np.float32)
 
     n_test = test_nn.shape[0]
-    for name, oof in [("NN", oof_nn), ("LGBM", oof_lgbm), ("XGBoost", oof_xgb),
+    for name, oof in [("NN", oof_nn), ("TabR", oof_tabr), ("LGBM", oof_lgbm), ("XGBoost", oof_xgb),
                       ("PyBoost", oof_pb), ("CatBoost", oof_cb), ("LGBM_meta", oof_lgbm_meta)]:
         auc, _ = compute_macro_auc(y, oof, target_cols)
         print(f"  {name}: {auc:.4f}")
@@ -174,9 +184,9 @@ def main():
     # Rank blend baseline
     print(f"\n  Computing rank blend baseline ({n_models} models)...")
     blend_weights, oof_ranks = optimize_rank_blend(
-        [oof_nn, oof_lgbm, oof_xgb, oof_pb, oof_cb, oof_lgbm_meta], y, target_cols, n_models
+        [oof_nn, oof_tabr, oof_lgbm, oof_xgb, oof_pb, oof_cb, oof_lgbm_meta], y, target_cols, n_models
     )
-    test_ranks = [to_ranks(test_nn), to_ranks(test_lgbm), to_ranks(test_xgb),
+    test_ranks = [to_ranks(test_nn), to_ranks(test_tabr), to_ranks(test_lgbm), to_ranks(test_xgb),
                   to_ranks(test_pb), to_ranks(test_cb), to_ranks(test_lgbm_meta)]
 
     baseline_oof = np.zeros_like(oof_nn)
@@ -189,10 +199,10 @@ def main():
     baseline_auc, _ = compute_macro_auc(y, baseline_oof, target_cols)
     print(f"  Rank blend baseline: {baseline_auc:.4f}")
 
-    # Build meta-features (5 models)
+    # Build meta-features (7 models)
     print("\n[2/4] Building meta-features...")
-    X_meta_train = build_meta_features(oof_nn, oof_lgbm, oof_xgb, oof_pb, oof_cb, oof_lgbm_meta)
-    X_meta_test = build_meta_features(test_nn, test_lgbm, test_xgb, test_pb, test_cb, test_lgbm_meta)
+    X_meta_train = build_meta_features(oof_nn, oof_tabr, oof_lgbm, oof_xgb, oof_pb, oof_cb, oof_lgbm_meta)
+    X_meta_test = build_meta_features(test_nn, test_tabr, test_lgbm, test_xgb, test_pb, test_cb, test_lgbm_meta)
     print(f"  Meta-features: {X_meta_train.shape[1]}")
 
     # LGBM stacking
