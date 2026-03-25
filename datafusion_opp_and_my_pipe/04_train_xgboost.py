@@ -112,9 +112,18 @@ def load_xgb_params():
 
 def _train_one_target(target_idx, target_name, fold_idx, threads,
                       X_tr, y_tr, X_val, y_val, X_test,
-                      xgb_params, fold_aucs_per_target=None):
+                      xgb_params, fold_aucs_per_target=None, has_oof_features=False, n_base_features=0):
     """Train a single target — runs in a thread (XGBoost releases GIL)."""
     y_t = y_tr[:, target_idx]
+
+    # Mask own-target OOF feature to prevent leakage
+    X_tr_masked = X_tr.copy() if has_oof_features else X_tr
+    X_val_masked = X_val.copy() if has_oof_features else X_val
+    if has_oof_features and n_base_features > 0:
+        # OOF features start at index n_base_features
+        oof_col_idx = n_base_features + target_idx
+        X_tr_masked[:, oof_col_idx] = np.nan
+        X_val_masked[:, oof_col_idx] = np.nan
     n_neg = int((y_t == 0).sum())
     n_pos = int((y_t == 1).sum())
     pos_rate = n_pos / (n_pos + n_neg)
@@ -146,8 +155,8 @@ def _train_one_target(target_idx, target_name, fold_idx, threads,
 
     model = xgb.XGBClassifier(**params, early_stopping_rounds=early_stop)
     model.fit(
-        X_tr, y_tr[:, target_idx],
-        eval_set=[(X_val, y_val[:, target_idx])],
+        X_tr_masked, y_tr[:, target_idx],
+        eval_set=[(X_val_masked, y_val[:, target_idx])],
         verbose=False,
     )
 
@@ -185,6 +194,19 @@ def main():
     X_test = test_feat.drop("customer_id").to_numpy().astype(np.float32)
     y_train = train_tgt.select(target_cols).to_numpy().astype(np.float32)
 
+    # Load cross-target OOF features (from 01c_add_oof_features.py)
+    oof_feat_path = FEATURES_DIR / "oof_features_train.parquet"
+    if oof_feat_path.exists():
+        oof_feats_train = pl.read_parquet(oof_feat_path).to_numpy().astype(np.float32)
+        oof_feats_test = pl.read_parquet(FEATURES_DIR / "oof_features_test.parquet").to_numpy().astype(np.float32)
+        X_train = np.hstack([X_train, oof_feats_train])
+        X_test = np.hstack([X_test, oof_feats_test])
+        has_oof_features = True
+        print(f"  Added {oof_feats_train.shape[1]} cross-target OOF features")
+    else:
+        has_oof_features = False
+        print(f"  OOF features not found (optional)")
+
     print(f"  X_train: {X_train.shape}, X_test: {X_test.shape}")
     print(f"  Features: {len(feature_cols)}")
 
@@ -207,6 +229,8 @@ def main():
     kf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     print(f"\n[2/4] Training {N_FOLDS}-Fold × {n_targets} targets...", flush=True)
 
+    # Track OOF feature columns for masking
+    n_base_features = len(feature_cols) if not has_oof_features else len(feature_cols)
     fold_aucs_per_target = {}  # Track per-target AUC from fold 1 for difficulty override
 
     for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(np.arange(n_train), y_train)):
@@ -226,7 +250,7 @@ def main():
                 futures[executor.submit(
                     _train_one_target, i, col, fold_idx, THREADS_PER_MODEL,
                     X_tr, y_tr, X_val, y_val, X_test,
-                    xgb_params, fold_aucs_per_target,
+                    xgb_params, fold_aucs_per_target, has_oof_features, n_base_features,
                 )] = i
 
             done_count = 0

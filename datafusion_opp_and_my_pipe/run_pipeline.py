@@ -53,6 +53,13 @@ STEPS = [
         depends_on=("fe",),
     ),
     Step(
+        key="oof_feats",
+        label="Cross-target OOF features",
+        script="01c_add_oof_features.py",
+        outputs=("features/oof_features_train.parquet", "features/oof_features_test.parquet"),
+        depends_on=("nn", "lgbm", "xgboost", "pyboost", "catboost"),
+    ),
+    Step(
         key="nn",
         label="Neural network",
         script="02_train_nn.py",

@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import polars as pl
 from catboost import CatBoostClassifier, Pool
 from sklearn.metrics import roc_auc_score
@@ -134,6 +135,19 @@ def main():
         X_train[col] = X_train[col].astype(str)
         X_test[col] = X_test[col].astype(str)
 
+    # Load cross-target OOF features (from 01c_add_oof_features.py)
+    oof_feat_path = FEATURES_DIR / "oof_features_train.parquet"
+    if oof_feat_path.exists():
+        oof_feats_train = pl.read_parquet(oof_feat_path).to_pandas()
+        oof_feats_test = pl.read_parquet(FEATURES_DIR / "oof_features_test.parquet").to_pandas()
+        X_train = pd.concat([X_train, oof_feats_train], axis=1)
+        X_test = pd.concat([X_test, oof_feats_test], axis=1)
+        has_oof_features = True
+        print(f"  Added {oof_feats_train.shape[1]} cross-target OOF features")
+    else:
+        has_oof_features = False
+        print(f"  OOF features not found (optional)")
+
     print(f"  X_train: {X_train.shape}, X_test: {X_test.shape}")
     print(f"  Features: {len(cat_feature_names)} cat, {len(feature_cols) - len(cat_feature_names)} num")
 
@@ -217,15 +231,22 @@ def main():
             if col in per_target_feats:
                 sel_cols = per_target_feats[col]
                 sel_cats = [c for c in cat_feature_names if c in sel_cols]
-                X_tr_t = X_train[sel_cols].iloc[tr_idx]
-                X_va_t = X_train[sel_cols].iloc[val_idx]
-                X_te_t = X_test[sel_cols]
+                X_tr_t = X_train[sel_cols].iloc[tr_idx].copy()
+                X_va_t = X_train[sel_cols].iloc[val_idx].copy()
+                X_te_t = X_test[sel_cols].copy()
             else:
-                sel_cols = feature_cols
+                sel_cols = list(X_train.columns)  # Include OOF features if loaded
                 sel_cats = cat_feature_names
-                X_tr_t = X_train.iloc[tr_idx]
-                X_va_t = X_train.iloc[val_idx]
-                X_te_t = X_test
+                X_tr_t = X_train.iloc[tr_idx].copy()
+                X_va_t = X_train.iloc[val_idx].copy()
+                X_te_t = X_test.copy()
+
+            # Mask own-target OOF feature to prevent leakage
+            if has_oof_features:
+                own_oof_col = f"oof_{col}"
+                if own_oof_col in X_tr_t.columns:
+                    X_tr_t[own_oof_col] = np.nan
+                    X_va_t[own_oof_col] = np.nan
 
             # Detect pseudo-categorical numeric features (nunique < 50)
             # CatBoost uses Ordered Target Statistics for categoricals — superior to threshold splits

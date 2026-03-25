@@ -108,6 +108,20 @@ def main():
     X_train = train_feat.drop("customer_id").to_numpy().astype(np.float32)
     X_test = test_feat.drop("customer_id").to_numpy().astype(np.float32)
     y = train_tgt.select(target_cols).to_numpy().astype(np.float32)
+
+    # Load cross-target OOF features (from 01c_add_oof_features.py)
+    # Note: PyBoost trains all targets jointly, so we cannot mask per-target OOF features
+    # Instead, we use consensus OOF as additional features for all targets
+    oof_feat_path = FEATURES_DIR / "oof_features_train.parquet"
+    if oof_feat_path.exists():
+        oof_feats_train = pl.read_parquet(oof_feat_path).to_numpy().astype(np.float32)
+        oof_feats_test = pl.read_parquet(FEATURES_DIR / "oof_features_test.parquet").to_numpy().astype(np.float32)
+        X_train = np.hstack([X_train, oof_feats_train])
+        X_test = np.hstack([X_test, oof_feats_test])
+        print(f"  Added {oof_feats_train.shape[1]} cross-target OOF features (no per-target masking for multi-output)")
+    else:
+        print(f"  OOF features not found (optional)")
+
     print(f"  X_train: {X_train.shape}, X_test: {X_test.shape}")
     print(f"  Features: {len(cat_feature_names)} cat, {len(feature_cols) - len(cat_feature_names)} num")
 
