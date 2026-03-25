@@ -3,9 +3,9 @@
 Loads features from features/ directory, trains DAE for semi-supervised
 bottleneck embeddings, then trains TabM with PLR encoding.
 
-Output: checkpoints_nn/fold_{0-4}.npz (val_preds, test_preds, val_idx)
+Output: checkpoints_nn/nn_predictions.npz (train_preds, test_preds)
 
-Runtime: ~2-3 hours on GPU, ~5-8 hours on MPS/CPU.
+Runtime: ~1-2 hours on GPU, ~3-5 hours on MPS/CPU.
 """
 
 import gc
@@ -20,11 +20,10 @@ import polars as pl
 import torch
 import torch.nn as nn
 from sklearn.metrics import roc_auc_score
-from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 from sklearn.preprocessing import QuantileTransformer
 from torch.utils.data import DataLoader, TensorDataset
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc, get_device
+from utils import SEED, DATA_DIR, compute_macro_auc, log_per_target_auc, get_device
 
 DEVICE = get_device()
 FEATURES_DIR = Path("features")
@@ -32,7 +31,7 @@ CHECKPOINT_DIR = Path("checkpoints_nn")
 
 # ── Hyperparameters ───────────────────────────────────────────────
 BATCH_SIZE = 1024
-EPOCHS = 100
+EPOCHS = 5
 LR = 5e-4
 WEIGHT_DECAY = 5e-4
 PATIENCE = 20
@@ -167,8 +166,14 @@ def train_dae(all_num_data, null_mask_np, device):
                   flush=True)
 
     orig_model = model._orig_mod if use_compile else model
-    torch.save({"epoch": DAE_EPOCHS, "model_state_dict": orig_model.state_dict(),
-                "loss": total_loss / n_batches}, ckpt_final)
+    torch.save(
+        {
+            "epoch": DAE_EPOCHS,
+            "model_state_dict": orig_model.state_dict(),
+            "loss": total_loss / n_batches,
+        },
+        ckpt_final,
+    )
     del data_tensor, non_null_tensor
     return model
 
@@ -379,8 +384,8 @@ def to_tensors(df_feat, cat_cols, num_cols, cat_cardinalities, df_tgt=None, targ
     return torch.from_numpy(cat_np), torch.from_numpy(num_arr)
 
 
-def quantile_normalize(train_num, val_num, test_num):
-    """Quantile-transform to N(0,1). Fit on train only."""
+def quantile_normalize(train_num, test_num):
+    """Quantile-transform to N(0,1). Fit on full train only."""
     n = train_num.shape[0]
     qt = QuantileTransformer(n_quantiles=min(1000, n), output_distribution="normal",
                              subsample=min(100_000, n), random_state=SEED)
@@ -388,7 +393,6 @@ def quantile_normalize(train_num, val_num, test_num):
     qt.fit(tr_np)
     return (
         torch.from_numpy(np.nan_to_num(qt.transform(tr_np), nan=0.0).astype(np.float32)),
-        torch.from_numpy(np.nan_to_num(qt.transform(val_num.numpy()), nan=0.0).astype(np.float32)),
         torch.from_numpy(np.nan_to_num(qt.transform(test_num.numpy()), nan=0.0).astype(np.float32)),
     )
 
@@ -421,17 +425,6 @@ def train_epoch(model, loader, optimizer, criterion, device):
 
 
 @torch.no_grad()
-def evaluate_model(model, loader, device):
-    model.eval()
-    all_preds, all_targets = [], []
-    for x_cat, x_num, y in loader:
-        probs = model(x_cat.to(device), x_num.to(device))
-        all_preds.append(probs.cpu())
-        all_targets.append(y)
-    return torch.cat(all_preds).numpy(), torch.cat(all_targets).numpy()
-
-
-@torch.no_grad()
 def predict_model(model, loader, device):
     model.eval()
     all_preds = []
@@ -441,55 +434,63 @@ def predict_model(model, loader, device):
     return torch.cat(all_preds).numpy()
 
 
-def train_one_fold(fold_idx, tr_cat, tr_num, tr_y, val_cat, val_num, val_y,
-                   test_cat, test_num, cat_cardinalities, n_numerical,
-                   target_cols, device):
-    train_loader = DataLoader(TensorDataset(tr_cat, tr_num, tr_y),
-                              batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-    val_loader = DataLoader(TensorDataset(val_cat, val_num, val_y),
-                            batch_size=BATCH_SIZE * 2, shuffle=False)
-    test_loader = DataLoader(TensorDataset(test_cat, test_num),
-                             batch_size=BATCH_SIZE * 2, shuffle=False)
+def train_full_model(train_cat, train_num, train_y, test_cat, test_num,
+                     cat_cardinalities, n_numerical, target_cols, device):
+    train_loader = DataLoader(
+        TensorDataset(train_cat, train_num, train_y),
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        drop_last=True,
+    )
+    train_eval_loader = DataLoader(
+        TensorDataset(train_cat, train_num),
+        batch_size=BATCH_SIZE * 2,
+        shuffle=False,
+    )
+    test_loader = DataLoader(
+        TensorDataset(test_cat, test_num),
+        batch_size=BATCH_SIZE * 2,
+        shuffle=False,
+    )
 
     model = TabularNet(cat_cardinalities, n_numerical, len(target_cols)).to(device)
-    if fold_idx == 0:
-        n_params = sum(p.numel() for p in model.parameters())
-        print(f"  Model: {n_params:,} parameters (k={K_ENSEMBLE})")
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  Model: {n_params:,} parameters (k={K_ENSEMBLE})")
 
-    model.plr.set_bins(tr_num.numpy())
+    model.plr.set_bins(train_num.numpy())
     criterion = AsymmetricLoss(ASL_GAMMA_NEG, ASL_GAMMA_POS, ASL_CLIP)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-6
+        optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-6
     )
 
-    best_auc, patience_counter = 0, 0
+    best_loss, patience_counter = float("inf"), 0
     top_states = []
 
     for epoch in range(EPOCHS):
         t1 = time.time()
         train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-        val_preds, val_targets = evaluate_model(model, val_loader, device)
-        macro_auc, _ = compute_macro_auc(val_targets, val_preds, target_cols)
-        scheduler.step(macro_auc)
+        scheduler.step(train_loss)
 
         improved = ""
-        if macro_auc > best_auc:
-            best_auc = macro_auc
+        if train_loss < best_loss:
+            best_loss = train_loss
             patience_counter = 0
             improved = " *"
         else:
             patience_counter += 1
 
         state_copy = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        top_states.append((macro_auc, state_copy))
-        top_states.sort(key=lambda x: x[0], reverse=True)
+        top_states.append((train_loss, state_copy))
+        top_states.sort(key=lambda x: x[0])
         if len(top_states) > TOP_K_SWA:
             top_states.pop()
 
-        print(f"    Ep {epoch+1:2d}/{EPOCHS}  loss={train_loss:.4f}  "
-              f"val_auc={macro_auc:.4f}  lr={optimizer.param_groups[0]['lr']:.1e}  "
-              f"{time.time()-t1:.1f}s{improved}", flush=True)
+        print(
+            f"    Ep {epoch+1:2d}/{EPOCHS}  train_loss={train_loss:.4f}  "
+            f"lr={optimizer.param_groups[0]['lr']:.1e}  {time.time()-t1:.1f}s{improved}",
+            flush=True,
+        )
 
         if patience_counter >= PATIENCE:
             print(f"    Early stop at epoch {epoch+1}")
@@ -502,26 +503,10 @@ def train_one_fold(fold_idx, tr_cat, tr_num, tr_y, val_cat, val_num, val_y,
     model.load_state_dict(avg_state)
     model.to(device)
 
-    val_preds, _ = evaluate_model(model, val_loader, device)
-    swa_auc, _ = compute_macro_auc(val_targets, val_preds, target_cols)
+    train_preds = predict_model(model, train_eval_loader, device)
     test_preds = predict_model(model, test_loader, device)
-
-    # Save SWA model weights
-    model_path = CHECKPOINT_DIR / f"tabm_fold{fold_idx}.pt"
-    orig_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-    torch.save({
-        "fold": fold_idx,
-        "model_state_dict": orig_model.state_dict(),
-        "swa_auc": swa_auc,
-        "best_auc": best_auc,
-        "n_numerical": n_numerical,
-        "cat_cardinalities": cat_cardinalities,
-        "n_targets": len(target_cols),
-    }, model_path)
-
-    print(f"  Fold {fold_idx+1} best={best_auc:.4f}, SWA={swa_auc:.4f}", flush=True)
-    print(f"  Saved model: {model_path}", flush=True)
-    return val_preds, test_preds, swa_auc
+    print(f"  Best train loss={best_loss:.4f} after SWA over top {len(top_states)} checkpoints", flush=True)
+    return model, train_preds, test_preds, best_loss
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -606,93 +591,79 @@ def main():
     all_num_cols = [c for c in train_feat.columns if c != "customer_id" and c not in cat_cols]
     print(f"  Total numerical features (with DAE): {len(all_num_cols)}")
 
-    # 3. Convert test
-    print("\n[3/5] Converting test to tensors...")
-    test_cat, test_num = to_tensors(test_feat, cat_cols, all_num_cols, cat_cardinalities)
-
-    # 4. K-Fold CV
-    print(f"\n[4/5] Training {N_FOLDS}-Fold CV...", flush=True)
+    # 3. Convert train/test
+    print("\n[3/5] Converting train/test to tensors...")
     CHECKPOINT_DIR.mkdir(exist_ok=True)
-    kf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    train_cat, train_num, train_y = to_tensors(
+        train_feat, cat_cols, all_num_cols, cat_cardinalities, train_tgt, target_cols
+    )
+    test_cat, test_num = to_tensors(test_feat, cat_cols, all_num_cols, cat_cardinalities)
+    train_num, test_num_normed = quantile_normalize(train_num, test_num.clone())
 
-    n_train = train_feat.height
-    n_test = test_feat.height
-    n_targets = len(target_cols)
-    y_for_split = train_tgt.select(target_cols).to_numpy().astype(np.float32)
-    oof_preds = np.zeros((n_train, n_targets))
-    test_preds_sum = np.zeros((n_test, n_targets))
-    fold_aucs = []
+    # 4. Single-fit training
+    print("\n[4/5] Training single TabM model...", flush=True)
+    model, train_preds, test_preds, best_loss = train_full_model(
+        train_cat,
+        train_num,
+        train_y,
+        test_cat,
+        test_num_normed,
+        cat_cardinalities,
+        len(all_num_cols),
+        target_cols,
+        DEVICE,
+    )
 
-    # Check for fold checkpoints
-    resume_fold = 0
-    for fi in range(N_FOLDS):
-        ckpt_path = CHECKPOINT_DIR / f"fold_{fi}.npz"
-        if ckpt_path.exists():
-            ckpt = np.load(ckpt_path)
-            oof_preds[ckpt["val_idx"]] = ckpt["val_preds"]
-            test_preds_sum += ckpt["test_preds"]
-            fold_aucs.append(float(ckpt["fold_auc"]))
-            print(f"  Loaded fold {fi+1} (AUC={float(ckpt['fold_auc']):.4f})", flush=True)
-            resume_fold = fi + 1
-        else:
-            break
+    orig_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    model_path = CHECKPOINT_DIR / "tabm_fold0.pt"
+    torch.save(
+        {
+            "fold": 0,
+            "model_state_dict": orig_model.state_dict(),
+            "best_train_loss": best_loss,
+            "n_numerical": len(all_num_cols),
+            "cat_cardinalities": cat_cardinalities,
+            "n_targets": len(target_cols),
+        },
+        model_path,
+    )
+    print(f"  Saved model: {model_path}")
 
-    for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(np.arange(n_train), y_for_split)):
-        if fold_idx < resume_fold:
-            continue
-        print(f"\n  ── Fold {fold_idx+1}/{N_FOLDS} ──", flush=True)
+    np.savez(
+        CHECKPOINT_DIR / "nn_predictions.npz",
+        train_preds=train_preds,
+        test_preds=test_preds,
+    )
+    print(f"  Saved: {CHECKPOINT_DIR / 'nn_predictions.npz'}")
 
-        tr_feat = train_feat[tr_idx.tolist()]
-        val_feat_fold = train_feat[val_idx.tolist()]
-        tr_tgt = train_tgt[tr_idx.tolist()]
-        val_tgt = train_tgt[val_idx.tolist()]
-
-        tr_cat, tr_num, tr_y = to_tensors(tr_feat, cat_cols, all_num_cols, cat_cardinalities, tr_tgt, target_cols)
-        val_cat, val_num, val_y = to_tensors(val_feat_fold, cat_cols, all_num_cols, cat_cardinalities, val_tgt, target_cols)
-
-        tr_num, val_num, test_num_normed = quantile_normalize(tr_num, val_num, test_num.clone())
-        del tr_feat, val_feat_fold, tr_tgt, val_tgt; gc.collect()
-
-        val_preds, test_preds, fold_auc = train_one_fold(
-            fold_idx, tr_cat, tr_num, tr_y, val_cat, val_num, val_y,
-            test_cat, test_num_normed, cat_cardinalities, len(all_num_cols),
-            target_cols, DEVICE,
-        )
-
-        oof_preds[val_idx] = val_preds
-        test_preds_sum += test_preds
-        fold_aucs.append(fold_auc)
-
-        np.savez(CHECKPOINT_DIR / f"fold_{fold_idx}.npz",
-                 val_idx=val_idx, val_preds=val_preds,
-                 test_preds=test_preds, fold_auc=fold_auc)
-
-        del tr_cat, tr_num, tr_y, val_cat, val_num, val_y, test_num_normed; gc.collect()
-        if DEVICE.type == "mps":
-            torch.mps.empty_cache()
+    del model, train_cat, train_num, train_y, test_cat, test_num, test_num_normed
+    gc.collect()
+    if DEVICE.type == "mps":
+        torch.mps.empty_cache()
 
     # 5. Evaluation
-    print(f"\n[5/5] Evaluation...", flush=True)
-    oof_y = train_tgt.select(target_cols).to_numpy().astype(np.float32)
-    oof_auc, per_target_aucs = compute_macro_auc(oof_y, oof_preds, target_cols)
-    print(f"  Per-fold AUC: {['%.4f' % a for a in fold_aucs]}")
-    print(f"  OOF Macro ROC-AUC: {oof_auc:.4f}")
-    log_per_target_auc(per_target_aucs, oof_y, target_cols)
+    print("\n[5/5] Evaluation...", flush=True)
+    train_auc, per_target_aucs = compute_macro_auc(
+        train_tgt.select(target_cols).to_numpy().astype(np.float32),
+        train_preds,
+        target_cols,
+    )
+    print(f"  Train Macro ROC-AUC: {train_auc:.4f}")
+    log_per_target_auc(per_target_aucs, train_tgt.select(target_cols).to_numpy().astype(np.float32), target_cols)
 
     # Save submission
-    test_preds_avg = test_preds_sum / N_FOLDS
     from utils import verify_submission
     sample = pl.read_parquet(f"{DATA_DIR}sample_submit.parquet")
     predict_cols = [c.replace("target_", "predict_") for c in target_cols]
     submit = pl.DataFrame({"customer_id": test_feat["customer_id"]}).hstack(
-        pl.DataFrame(test_preds_avg.astype(np.float64), schema=predict_cols)
+        pl.DataFrame(test_preds.astype(np.float64), schema=predict_cols)
     )
     verify_submission(submit, sample)
     Path("submissions").mkdir(exist_ok=True)
     submit.write_parquet("submissions/nn.parquet")
     print(f"  Saved: submissions/nn.parquet")
 
-    print(f"\nDone in {(time.time()-t0)/60:.1f} min. OOF={oof_auc:.4f}")
+    print(f"\nDone in {(time.time()-t0)/60:.1f} min. Train AUC={train_auc:.4f}")
 
 
 if __name__ == "__main__":

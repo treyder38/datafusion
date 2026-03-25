@@ -15,7 +15,6 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-N_FOLDS = 4
 
 
 @dataclass(frozen=True)
@@ -56,7 +55,7 @@ STEPS = [
         key="nn",
         label="Neural network",
         script="02_train_nn.py",
-        outputs=tuple(f"checkpoints_nn/fold_{i}.npz" for i in range(N_FOLDS)),
+        outputs=("checkpoints_nn/nn_predictions.npz",),
         depends_on=("fe",),
     ),
     Step(
@@ -105,7 +104,7 @@ STEPS = [
         key="stacking",
         label="Stacking",
         script="09_stacking.py",
-        outputs=("submissions/stacking.parquet",),
+        outputs=("submissions/stacking.parquet", "checkpoints_stacking/stacking_predictions.npz"),
         depends_on=("blend",),
     ),
 ]

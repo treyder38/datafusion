@@ -1,9 +1,9 @@
-"""Step 4: Train XGBoost (4-fold x 41 targets).
+"""Step 4: Train XGBoost (single-fit, no OOF).
 
 Loads features from features/, trains 41 per-target binary classifiers.
 Targets are trained in parallel batches for speed (XGBoost releases GIL).
 
-Output: checkpoints_xgboost/xgb_predictions.npz (oof_preds, test_preds)
+Output: checkpoints_xgboost/xgb_predictions.npz (train_preds, test_preds)
 
 Runtime: ~10-20 minutes.
 """
@@ -11,19 +11,18 @@ Runtime: ~10-20 minutes.
 import gc
 import json
 import os
+import pickle
 import sys
 import time
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
 import polars as pl
 import xgboost as xgb
-from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc, effective_number_weight
+from utils import DATA_DIR, SEED, compute_macro_auc, effective_number_weight, log_per_target_auc
 
 FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_xgboost")
@@ -64,51 +63,86 @@ def load_xgb_params():
         for k, v in tuned.items():
             print(f"    {k}: {v}")
     else:
-        print(f"  No tuned params found, using defaults")
+        print("  No tuned params found, using defaults")
     return params
 
 
-def _train_one_target(target_idx, target_name, fold_idx, threads,
-                      X_tr, y_tr, X_val, y_val, X_test,
-                      xgb_params):
-    """Train a single target — runs in a thread (XGBoost releases GIL)."""
-    y_t = y_tr[:, target_idx]
-    n_neg = int((y_t == 0).sum())
-    n_pos = int((y_t == 1).sum())
-    spw = effective_number_weight(n_pos, n_neg)
-    params = {**xgb_params, "nthread": threads, "scale_pos_weight": spw}
+def make_validation_split(y_train):
+    """Single holdout split for early stopping only."""
+    splitter = MultilabelStratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    tr_idx, val_idx = next(splitter.split(np.arange(len(y_train)), y_train))
+    return tr_idx, val_idx
 
-    model = xgb.XGBClassifier(**params)
+
+def _best_iteration_or_default(model, default_n_estimators):
+    best_iteration = getattr(model, "best_iteration", None)
+    if best_iteration is None or best_iteration < 0:
+        return default_n_estimators
+    return int(best_iteration) + 1
+
+
+def _train_one_target(
+    target_idx,
+    target_name,
+    threads,
+    X_fit,
+    y_fit,
+    X_val,
+    y_val,
+    X_train,
+    y_train,
+    X_test,
+    xgb_params,
+):
+    """Train a single target with a holdout for early stopping, then refit on full train."""
+    y_fit_t = y_fit[:, target_idx]
+    fit_spw = effective_number_weight(int((y_fit_t == 1).sum()), int((y_fit_t == 0).sum()))
+    fit_params = {**xgb_params, "nthread": threads, "scale_pos_weight": fit_spw}
+
+    model = xgb.XGBClassifier(**fit_params, early_stopping_rounds=EARLY_STOPPING_ROUNDS)
     model.fit(
-        X_tr, y_tr[:, target_idx],
+        X_fit,
+        y_fit_t,
         eval_set=[(X_val, y_val[:, target_idx])],
         verbose=False,
     )
 
-    val_preds = model.predict_proba(X_val)[:, 1]
-    test_preds = model.predict_proba(X_test)[:, 1]
-    model.save_model(str(MODELS_DIR / f"{target_name}_fold{fold_idx}.json"))
-    importance = model.feature_importances_
+    best_n_estimators = _best_iteration_or_default(model, xgb_params["n_estimators"])
 
-    return val_preds, test_preds, importance
+    y_full_t = y_train[:, target_idx]
+    full_spw = effective_number_weight(int((y_full_t == 1).sum()), int((y_full_t == 0).sum()))
+    final_params = {
+        **xgb_params,
+        "nthread": threads,
+        "n_estimators": best_n_estimators,
+        "scale_pos_weight": full_spw,
+    }
+    final_model = xgb.XGBClassifier(**final_params)
+    final_model.fit(X_train, y_full_t, verbose=False)
+
+    train_preds = final_model.predict_proba(X_train)[:, 1]
+    test_preds = final_model.predict_proba(X_test)[:, 1]
+    importance = final_model.feature_importances_
+
+    with open(MODELS_DIR / f"{target_name}.pkl", "wb") as f:
+        pickle.dump(final_model, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    return train_preds, test_preds, importance, best_n_estimators
 
 
 def main():
     t0 = time.time()
     print("=" * 60)
-    print(f"Step 4: Train XGBoost ({N_FOLDS}-fold × 41 targets)")
+    print("Step 4: Train XGBoost (single-fit x 41 targets)")
     print("=" * 60)
-    print(f"  XGBoost: CPU mode, {PARALLEL_TARGETS} parallel targets × {THREADS_PER_MODEL} threads")
+    print(f"  XGBoost: CPU mode, {PARALLEL_TARGETS} parallel targets x {THREADS_PER_MODEL} threads")
 
     xgb_params = load_xgb_params()
-    xgb_params["early_stopping_rounds"] = EARLY_STOPPING_ROUNDS
 
-    # 1. Load features
     print("\n[1/4] Loading features...")
     with open(FEATURES_DIR / "meta.json") as f:
         meta = json.load(f)
     all_feature_cols = meta["feature_names"]
-    feature_cols = list(all_feature_cols)
     target_cols = meta["target_cols"]
 
     train_feat = pl.read_parquet(FEATURES_DIR / "train_features.parquet")
@@ -120,9 +154,8 @@ def main():
     y_train = train_tgt.select(target_cols).to_numpy().astype(np.float32)
 
     print(f"  X_train: {X_train.shape}, X_test: {X_test.shape}")
-    print(f"  Features: {len(feature_cols)}")
+    print(f"  Features: {len(all_feature_cols)}")
 
-    # 2. Check cache
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     cache_file = CHECKPOINT_DIR / "xgb_predictions.npz"
@@ -130,105 +163,108 @@ def main():
         print(f"\n  Predictions exist at {cache_file}! Delete to retrain.")
         return
 
-    # 3. Train
-    n_train, n_test = X_train.shape[0], X_test.shape[0]
+    tr_idx, val_idx = make_validation_split(y_train)
+    X_fit = X_train[tr_idx]
+    X_val = X_train[val_idx]
+    y_fit = y_train[tr_idx]
+    y_val = y_train[val_idx]
+    print(f"\n[2/4] Training {len(target_cols)} targets with a single validation split...")
+    print(f"  Holdout: train={len(tr_idx):,}, val={len(val_idx):,}", flush=True)
+
     n_targets = len(target_cols)
-    oof_preds = np.zeros((n_train, n_targets))
-    test_preds_sum = np.zeros((n_test, n_targets))
-    fold_aucs = []
-    importance_sum = np.zeros((len(feature_cols), n_targets), dtype=np.float64)
+    train_preds = np.zeros((X_train.shape[0], n_targets), dtype=np.float32)
+    test_preds = np.zeros((X_test.shape[0], n_targets), dtype=np.float32)
+    importance_sum = np.zeros((len(all_feature_cols), n_targets), dtype=np.float64)
+    best_iterations = np.zeros(n_targets, dtype=np.int32)
 
-    kf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
-    print(f"\n[2/4] Training {N_FOLDS}-Fold × {n_targets} targets...", flush=True)
-
-    for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(np.arange(n_train), y_train)):
-        t_fold = time.time()
-        print(f"\n  ── Fold {fold_idx+1}/{N_FOLDS} "
-              f"(train={len(tr_idx):,}, val={len(val_idx):,}) ──", flush=True)
-
-        X_tr = X_train[tr_idx]
-        X_val = X_train[val_idx]
-        y_tr = y_train[tr_idx]
-        y_val = y_train[val_idx]
-        fold_test_preds = np.zeros((n_test, n_targets))
-
-        with ThreadPoolExecutor(max_workers=PARALLEL_TARGETS) as executor:
-            futures = {}
-            for i, col in enumerate(target_cols):
-                futures[executor.submit(
-                    _train_one_target, i, col, fold_idx, THREADS_PER_MODEL,
-                    X_tr, y_tr, X_val, y_val, X_test,
+    with ThreadPoolExecutor(max_workers=PARALLEL_TARGETS) as executor:
+        futures = {}
+        for i, col in enumerate(target_cols):
+            futures[
+                executor.submit(
+                    _train_one_target,
+                    i,
+                    col,
+                    THREADS_PER_MODEL,
+                    X_fit,
+                    y_fit,
+                    X_val,
+                    y_val,
+                    X_train,
+                    y_train,
+                    X_test,
                     xgb_params,
-                )] = i
+                )
+            ] = i
 
-            done_count = 0
-            for future in as_completed(futures):
-                i = futures[future]
-                val_p, test_p, imp = future.result()
-                oof_preds[val_idx, i] = val_p
-                fold_test_preds[:, i] = test_p
-                importance_sum[:, i] += imp
-                done_count += 1
-                if done_count % 10 == 0 or done_count == n_targets:
-                    print(f"    {done_count}/{n_targets} targets done", flush=True)
+        done_count = 0
+        for future in as_completed(futures):
+            i = futures[future]
+            train_p, test_p, imp, best_iter = future.result()
+            train_preds[:, i] = train_p
+            test_preds[:, i] = test_p
+            importance_sum[:, i] += imp
+            best_iterations[i] = best_iter
+            done_count += 1
+            if done_count % 10 == 0 or done_count == n_targets:
+                print(f"    {done_count}/{n_targets} targets done", flush=True)
 
-        fold_auc, _ = compute_macro_auc(y_val, oof_preds[val_idx], target_cols)
-        test_preds_sum += fold_test_preds
-        fold_aucs.append(fold_auc)
-        del X_tr, X_val, y_tr, y_val; gc.collect()
-        print(f"  Fold {fold_idx+1} AUC={fold_auc:.4f} ({(time.time()-t_fold)/60:.1f} min)", flush=True)
-
-    test_preds_avg = test_preds_sum / N_FOLDS
-
-    # 4. Results
-    oof_auc, per_target_aucs = compute_macro_auc(y_train, oof_preds, target_cols)
-    print(f"\n[3/4] Results:")
-    print(f"  Per-fold AUC: {['%.4f' % a for a in fold_aucs]}")
-    print(f"  OOF Macro ROC-AUC: {oof_auc:.4f}")
+    train_auc, per_target_aucs = compute_macro_auc(y_train, train_preds, target_cols)
+    print("\n[3/4] Results:")
+    print(f"  Train Macro ROC-AUC: {train_auc:.4f}")
     log_per_target_auc(per_target_aucs, y_train, target_cols)
 
-    # Save predictions
-    np.savez(cache_file, oof_preds=oof_preds, test_preds=test_preds_avg,
-             fold_aucs=np.array(fold_aucs))
+    np.savez(
+        cache_file,
+        train_preds=train_preds,
+        test_preds=test_preds,
+        best_iterations=best_iterations,
+    )
     print(f"  Saved: {cache_file}")
 
-    # Save averaged feature importances
-    importance_avg = importance_sum / N_FOLDS
     imp_path = CHECKPOINT_DIR / "feature_importances.json"
     imp_data = {
         "feature_names": all_feature_cols,
         "target_cols": target_cols,
         "importances_per_target": {
-            col: dict(sorted(
-                zip(all_feature_cols, importance_avg[:, i].tolist()),
-                key=lambda x: x[1], reverse=True
-            ))
+            col: dict(
+                sorted(
+                    zip(all_feature_cols, importance_sum[:, i].tolist()),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+            )
             for i, col in enumerate(target_cols)
         },
-        "mean_importance": dict(sorted(
-            zip(all_feature_cols, importance_avg.mean(axis=1).tolist()),
-            key=lambda x: x[1], reverse=True
-        )),
+        "mean_importance": dict(
+            sorted(
+                zip(all_feature_cols, importance_sum.mean(axis=1).tolist()),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+        ),
     }
     with open(imp_path, "w") as f:
         json.dump(imp_data, f, indent=2)
     print(f"  Saved: {imp_path}")
-    print(f"  Models: {MODELS_DIR}/ ({N_FOLDS * n_targets} .json files)")
+    print(f"  Models: {MODELS_DIR}/ ({n_targets} .pkl files)")
 
-    # Save submission
     print("\n[4/4] Saving submission...")
     from utils import verify_submission
+
     sample = pl.read_parquet(f"{DATA_DIR}sample_submit.parquet")
     predict_cols = [c.replace("target_", "predict_") for c in target_cols]
     submit = pl.DataFrame({"customer_id": test_feat["customer_id"]}).hstack(
-        pl.DataFrame(test_preds_avg.astype(np.float64), schema=predict_cols)
+        pl.DataFrame(test_preds.astype(np.float64), schema=predict_cols)
     )
     verify_submission(submit, sample)
     Path("submissions").mkdir(exist_ok=True)
     submit.write_parquet("submissions/xgboost.parquet")
-    print(f"  Saved: submissions/xgboost.parquet")
+    print("  Saved: submissions/xgboost.parquet")
 
-    print(f"\nDone in {(time.time()-t0)/60:.1f} min. OOF={oof_auc:.4f}")
+    del X_fit, X_val, y_fit, y_val
+    gc.collect()
+    print(f"\nDone in {(time.time() - t0) / 60:.1f} min. Train AUC={train_auc:.4f}")
 
 
 if __name__ == "__main__":

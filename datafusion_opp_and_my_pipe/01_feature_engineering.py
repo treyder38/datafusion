@@ -113,20 +113,25 @@ SHIFT_DROP = [
 # EDA-based drop: main features never in top-200 for any target (CatBoost importance).
 # Excludes features used in engineering configs (NULL_GROUPS, RATIO_FEATURES, etc.)
 # and features already in SHIFT_DROP.
-EDA_DROP_MAIN = [
-    "cat_feature_34",
-    "num_feature_3", "num_feature_9", "num_feature_12", "num_feature_14",
-    "num_feature_20", "num_feature_22", "num_feature_28", "num_feature_32",
-    "num_feature_37", "num_feature_44", "num_feature_45", "num_feature_47",
-    "num_feature_49", "num_feature_55", "num_feature_70", "num_feature_78",
-    "num_feature_80", "num_feature_82", "num_feature_84", "num_feature_89",
-    "num_feature_91", "num_feature_92", "num_feature_93", "num_feature_101",
-    "num_feature_102", "num_feature_106", "num_feature_110", "num_feature_112",
-    "num_feature_113", "num_feature_115", "num_feature_122", "num_feature_123",
-]
+# EDA_DROP_MAIN = [
+#     "cat_feature_34",
+#     "num_feature_3", "num_feature_9", "num_feature_12", "num_feature_14",
+#     "num_feature_20", "num_feature_22", "num_feature_28", "num_feature_32",
+#     "num_feature_37", "num_feature_44", "num_feature_45", "num_feature_47",
+#     "num_feature_49", "num_feature_55", "num_feature_70", "num_feature_78",
+#     "num_feature_80", "num_feature_82", "num_feature_84", "num_feature_89",
+#     "num_feature_91", "num_feature_92", "num_feature_93", "num_feature_101",
+#     "num_feature_102", "num_feature_106", "num_feature_110", "num_feature_112",
+#     "num_feature_113", "num_feature_115", "num_feature_122", "num_feature_123",
+# ]
+
+EDA_DROP_MAIN = ["dummy"]
 
 # EDA-based drop: 981 extra features never in top-200 for any target
-EDA_EXTRA_DROP_FILE = Path("eda_extra_drop.json")
+# EDA_EXTRA_DROP_FILE = Path("eda_extra_drop.json")
+
+
+EDA_EXTRA_DROP_FILE = Path("eda_extra_drop_dummy.json")
 
 
 # ── Helper functions ──────────────────────────────────────────────

@@ -1,30 +1,30 @@
-"""Step 5: Train PyBoost (SketchBoost, requires NVIDIA GPU with CUDA).
+"""Step 5: Train PyBoost (single-fit, no OOF).
 
-Loads features from features/, trains SketchBoost multi-output model.
+Loads features from features/, trains one SketchBoost multi-output model.
 
-Output: checkpoints_pyboost/pyboost_predictions.npz (oof_preds, test_preds)
+Output: checkpoints_pyboost/pyboost_predictions.npz (train_preds, test_preds)
 
-Runtime: ~1-2 hours on T4 GPU.
+Runtime: ~20-40 minutes on a CUDA GPU.
 """
 
 import gc
 import json
 import os
+import pickle
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import polars as pl
-from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
-from utils import SEED, DATA_DIR, N_FOLDS, compute_macro_auc, log_per_target_auc
+from utils import DATA_DIR, SEED, compute_macro_auc, log_per_target_auc
 
 FEATURES_DIR = Path("features")
 CHECKPOINT_DIR = Path("checkpoints_pyboost")
+MODELS_DIR = CHECKPOINT_DIR / "models"
 
-# Optuna-tuned params (25 trials on fold 0)
 PARAMS = dict(
     ntrees=5000,
     lr=0.0566,
@@ -41,15 +41,26 @@ PARAMS = dict(
 )
 
 
+def make_validation_split(y_train):
+    """Single holdout split for early stopping only."""
+    splitter = MultilabelStratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    tr_idx, val_idx = next(splitter.split(np.arange(len(y_train)), y_train))
+    return tr_idx, val_idx
+
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
 def main():
     t0 = time.time()
     print("=" * 60)
-    print("Step 5: Train PyBoost (SketchBoost)")
+    print("Step 5: Train PyBoost (single-fit SketchBoost)")
     print("=" * 60)
 
-    # Check CUDA
     try:
         import torch
+
         if not torch.cuda.is_available():
             print("\nERROR: PyBoost requires NVIDIA GPU with CUDA.")
             print("  This script uses cupy + py-boost which only work on CUDA GPUs.")
@@ -67,7 +78,6 @@ def main():
         print("  pip install py-boost cupy-cuda12x")
         return
 
-    # 1. Load features
     print("\n[1/4] Loading features...")
     with open(FEATURES_DIR / "meta.json") as f:
         meta = json.load(f)
@@ -81,66 +91,45 @@ def main():
 
     X_train = train_feat.drop("customer_id").to_numpy().astype(np.float32)
     X_test = test_feat.drop("customer_id").to_numpy().astype(np.float32)
-    y = train_tgt.select(target_cols).to_numpy().astype(np.float32)
+    y_train = train_tgt.select(target_cols).to_numpy().astype(np.float32)
     print(f"  X_train: {X_train.shape}, X_test: {X_test.shape}")
     print(f"  Features: {len(cat_feature_names)} cat, {len(feature_cols) - len(cat_feature_names)} num")
 
-    # 2. Check cache
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
     cache_file = CHECKPOINT_DIR / "pyboost_predictions.npz"
     if cache_file.exists():
         print(f"\n  Predictions exist at {cache_file}! Delete to retrain.")
         return
 
-    # 3. Train
-    print(f"\n[2/4] Training SketchBoost {N_FOLDS}-fold...")
-    mskf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
-    oof_preds = np.zeros_like(y, dtype=np.float64)
-    test_preds = np.zeros((X_test.shape[0], len(target_cols)), dtype=np.float64)
-    fold_scores = []
+    tr_idx, val_idx = make_validation_split(y_train)
+    X_fit, X_val = X_train[tr_idx], X_train[val_idx]
+    y_fit, y_val = y_train[tr_idx], y_train[val_idx]
 
-    for fold_idx, (tr_idx, val_idx) in enumerate(mskf.split(X_train, y)):
-        t_fold = time.time()
-        print(f"\n  ── Fold {fold_idx+1}/{N_FOLDS} "
-              f"(train={len(tr_idx):,}, val={len(val_idx):,}) ──", flush=True)
+    print("\n[2/4] Training SketchBoost with a single validation split...")
+    print(f"  Holdout: train={len(tr_idx):,}, val={len(val_idx):,}", flush=True)
 
-        X_tr, X_val = X_train[tr_idx], X_train[val_idx]
-        y_tr, y_val = y[tr_idx], y[val_idx]
+    model = SketchBoost("bce", **PARAMS)
+    model.fit(X_fit, y_fit, eval_sets=[{"X": X_val, "y": y_val}])
 
-        model = SketchBoost('bce', **PARAMS)
-        model.fit(X_tr, y_tr, eval_sets=[{'X': X_val, 'y': y_val}])
+    train_preds = sigmoid(model.predict(X_train)).astype(np.float32)
+    test_preds = sigmoid(model.predict(X_test)).astype(np.float32)
 
-        val_raw = model.predict(X_val)
-        test_raw = model.predict(X_test)
-        val_prob = 1.0 / (1.0 + np.exp(-val_raw))
-        test_prob = 1.0 / (1.0 + np.exp(-test_raw))
+    with open(MODELS_DIR / "pyboost.pkl", "wb") as f:
+        pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-        oof_preds[val_idx] = val_prob
-        test_preds += test_prob / N_FOLDS
+    train_auc, per_target_aucs = compute_macro_auc(y_train, train_preds, target_cols)
+    print("\n[3/4] Results:")
+    print(f"  Train Macro ROC-AUC: {train_auc:.4f}")
+    log_per_target_auc(per_target_aucs, y_train, target_cols)
 
-        fold_auc, _ = compute_macro_auc(y_val, val_prob, target_cols)
-        fold_scores.append(fold_auc)
-        print(f"  Fold {fold_idx+1} AUC={fold_auc:.4f} ({(time.time()-t_fold)/60:.1f} min)", flush=True)
-
-        del model, X_tr, X_val, y_tr, y_val, val_raw, test_raw, val_prob, test_prob
-        cp.get_default_memory_pool().free_all_blocks(); gc.collect()
-
-    # 4. Results
-    macro_auc, per_target_aucs = compute_macro_auc(y, oof_preds, target_cols)
-    print(f"\n[3/4] Results:")
-    print(f"  Per-fold AUC: {['%.4f' % s for s in fold_scores]}")
-    print(f"  OOF Macro ROC-AUC: {macro_auc:.4f}")
-    log_per_target_auc(per_target_aucs, y, target_cols)
-
-    # Save
-    np.savez_compressed(cache_file,
-                        oof_preds=oof_preds, test_preds=test_preds,
-                        fold_scores=fold_scores, macro_auc=macro_auc)
+    np.savez_compressed(cache_file, train_preds=train_preds, test_preds=test_preds)
     print(f"  Saved: {cache_file}")
+    print("  Saved: checkpoints_pyboost/models/pyboost.pkl")
 
-    # Save submission
     print("\n[4/4] Saving submission...")
     from utils import verify_submission
+
     sample = pl.read_parquet(f"{DATA_DIR}sample_submit.parquet")
     predict_cols = [c.replace("target_", "predict_") for c in target_cols]
     submit = pl.DataFrame({"customer_id": test_feat["customer_id"]}).hstack(
@@ -149,9 +138,12 @@ def main():
     verify_submission(submit, sample)
     Path("submissions").mkdir(exist_ok=True)
     submit.write_parquet("submissions/pyboost.parquet")
-    print(f"  Saved: submissions/pyboost.parquet")
+    print("  Saved: submissions/pyboost.parquet")
 
-    print(f"\nDone in {(time.time()-t0)/60:.1f} min. OOF={macro_auc:.4f}")
+    del X_fit, X_val, y_fit, y_val, model
+    cp.get_default_memory_pool().free_all_blocks()
+    gc.collect()
+    print(f"\nDone in {(time.time() - t0) / 60:.1f} min. Train AUC={train_auc:.4f}")
 
 
 if __name__ == "__main__":

@@ -27,7 +27,6 @@ SELECTED_DIR = FEATURES_DIR / "selected_features"
 
 TOP_K = 350
 SUBSAMPLE_SIZE = 300_000
-N_SELECTION_FOLDS = 3  # average importance across folds for stability
 
 LGBM_PARAMS = dict(
     objective="binary",
@@ -61,31 +60,31 @@ def subsample_balanced(y, size=SUBSAMPLE_SIZE):
 
 
 def select_features_for_target(X, y, feature_names):
-    """Train N-fold LGBM and return top-K features by averaged gain importance."""
-    from sklearn.model_selection import StratifiedKFold
+    """Train one lightweight LGBM and return top-K features by gain importance."""
+    from sklearn.model_selection import StratifiedShuffleSplit
 
     n_neg = int((y == 0).sum())
     n_pos = int((y == 1).sum())
     spw = effective_number_weight(n_pos, n_neg)
 
-    importance_sum = np.zeros(X.shape[1], dtype=np.float64)
-    kf = StratifiedKFold(n_splits=N_SELECTION_FOLDS, shuffle=True, random_state=SEED)
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
+    tr_idx, val_idx = next(splitter.split(X, y))
 
-    for tr_idx, val_idx in kf.split(X, y):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            model = lgb.LGBMClassifier(**LGBM_PARAMS, scale_pos_weight=spw)
-            model.fit(
-                X[tr_idx], y[tr_idx],
-                eval_set=[(X[val_idx], y[val_idx])],
-                callbacks=[
-                    lgb.early_stopping(50, verbose=False),
-                    lgb.log_evaluation(0),
-                ],
-            )
-        importance_sum += model.booster_.feature_importance(importance_type="gain")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        model = lgb.LGBMClassifier(**LGBM_PARAMS, scale_pos_weight=spw)
+        model.fit(
+            X[tr_idx],
+            y[tr_idx],
+            eval_set=[(X[val_idx], y[val_idx])],
+            callbacks=[
+                lgb.early_stopping(50, verbose=False),
+                lgb.log_evaluation(0),
+            ],
+        )
 
-    top_indices = np.argsort(importance_sum)[::-1][:TOP_K]
+    importance = model.booster_.feature_importance(importance_type="gain")
+    top_indices = np.argsort(importance)[::-1][:TOP_K]
     return [feature_names[i] for i in top_indices]
 
 
