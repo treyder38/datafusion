@@ -359,14 +359,6 @@ class TabularNet(nn.Module):
 # ══════════════════════════════════════════════════════════════════
 
 
-def apply_label_smoothing(arr, epsilon=0.05):
-    """Apply label smoothing to binary targets.
-
-    Smooths hard labels {0, 1} toward center {epsilon, 1-epsilon}.
-    This encourages calibrated probability predictions and prevents overconfident models.
-    """
-    return epsilon + (1 - 2 * epsilon) * arr
-
 
 def to_tensors(df_feat, cat_cols, num_cols, cat_cardinalities, df_tgt=None, target_cols=None):
     """Convert Polars DataFrame to PyTorch tensors."""
@@ -556,14 +548,6 @@ def main():
     test_feat = pl.read_parquet(FEATURES_DIR / "test_features.parquet")
     train_tgt = pl.read_parquet(FEATURES_DIR / "targets.parquet")
 
-    # Keep hard labels for evaluation/stratification, smoothed labels for training only
-    train_tgt_hard = train_tgt  # original {0, 1} labels
-    train_tgt_arr = train_tgt.select(target_cols).to_numpy().astype(np.float32)
-    train_tgt_smooth_arr = apply_label_smoothing(train_tgt_arr, epsilon=0.05)
-    train_tgt_smooth = pl.DataFrame(train_tgt_smooth_arr, schema=target_cols).hstack(
-        train_tgt.select(["customer_id"]) if "customer_id" in train_tgt.columns else pl.DataFrame()
-    )
-
     print(f"  Features: {len(cat_cols)} cat, {len(num_cols_all)} num")
 
     # Cat cardinalities
@@ -662,8 +646,8 @@ def main():
 
         tr_feat = train_feat[tr_idx.tolist()]
         val_feat_fold = train_feat[val_idx.tolist()]
-        tr_tgt = train_tgt_smooth[tr_idx.tolist()]   # smoothed labels for training loss
-        val_tgt = train_tgt_hard[val_idx.tolist()]   # hard labels for evaluation
+        tr_tgt = train_tgt[tr_idx.tolist()]
+        val_tgt = train_tgt[val_idx.tolist()]
 
         tr_cat, tr_num, tr_y = to_tensors(tr_feat, cat_cols, all_num_cols, cat_cardinalities, tr_tgt, target_cols)
         val_cat, val_num, val_y = to_tensors(val_feat_fold, cat_cols, all_num_cols, cat_cardinalities, val_tgt, target_cols)

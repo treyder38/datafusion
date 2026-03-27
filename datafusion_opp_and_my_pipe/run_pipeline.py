@@ -60,6 +60,13 @@ STEPS = [
         depends_on=("nn", "lgbm", "xgboost", "pyboost", "catboost"),
     ),
     Step(
+        key="knn_feats",
+        label="kNN features",
+        script="01d_knn_features.py",
+        outputs=("features/knn_features_train.parquet", "features/knn_features_test.parquet"),
+        depends_on=("fe",),
+    ),
+    Step(
         key="nn",
         label="Neural network",
         script="02_train_nn.py",

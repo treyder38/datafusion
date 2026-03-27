@@ -122,6 +122,17 @@ def main():
     else:
         print(f"  OOF features not found (optional)")
 
+    # Load kNN features (from 01d_knn_features.py) — no masking needed (OOF-safe)
+    knn_feat_path = FEATURES_DIR / "knn_features_train.parquet"
+    if knn_feat_path.exists():
+        knn_train = pl.read_parquet(knn_feat_path).to_numpy().astype(np.float32)
+        knn_test = pl.read_parquet(FEATURES_DIR / "knn_features_test.parquet").to_numpy().astype(np.float32)
+        X_train = np.hstack([X_train, knn_train])
+        X_test = np.hstack([X_test, knn_test])
+        print(f"  Added {knn_train.shape[1]} kNN features")
+    else:
+        print(f"  kNN features not found (optional)")
+
     print(f"  X_train: {X_train.shape}, X_test: {X_test.shape}")
     print(f"  Features: {len(cat_feature_names)} cat, {len(feature_cols) - len(cat_feature_names)} num")
 
