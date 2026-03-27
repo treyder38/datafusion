@@ -202,6 +202,22 @@ def main():
     print(f"  LGBM_meta: OOF {lgbm_meta_auc:.5f}")
     model_names.append("LGBM_meta"); oof_list.append(oof_lgbm_meta); test_list.append(test_lgbm_meta)
 
+    # Diverse LGBM variants (optional — from 03b_train_lgbm_diverse.py)
+    diverse_path = Path("checkpoints_lgbm_diverse/lgbm_diverse_predictions.npz")
+    if diverse_path.exists():
+        dd = np.load(str(diverse_path))
+        for vkey in ["focal", "high_spw", "low_reg"]:
+            oof_key, test_key = f"oof_{vkey}", f"test_{vkey}"
+            if oof_key in dd:
+                oof_v, test_v = dd[oof_key], dd[test_key]
+                v_auc, _ = compute_macro_auc(y, oof_v, target_cols)
+                name = f"LGBM_{vkey}"
+                print(f"  {name}: OOF {v_auc:.5f}")
+                model_names.append(name); oof_list.append(oof_v); test_list.append(test_v)
+        print(f"  Loaded {sum(1 for k in ['focal','high_spw','low_reg'] if f'oof_{k}' in dd)} diverse LGBM variants")
+    else:
+        print(f"  Diverse LGBM: not found (optional)")
+
     n_models = len(model_names)
     print(f"\n  Total models: {n_models} ({', '.join(model_names)})")
 
@@ -256,6 +272,12 @@ def main():
     if "TabR" in model_names:
         save_dict["oof_tabr"] = oof_list[model_names.index("TabR")]
         save_dict["test_tabr"] = test_list[model_names.index("TabR")]
+    for vkey in ["focal", "high_spw", "low_reg"]:
+        name = f"LGBM_{vkey}"
+        if name in model_names:
+            idx = model_names.index(name)
+            save_dict[f"oof_lgbm_{vkey}"] = oof_list[idx]
+            save_dict[f"test_lgbm_{vkey}"] = test_list[idx]
     np.savez_compressed("blend_artifacts/blend_data.npz", **save_dict)
 
     print(f"\nDone in {time.time()-t0:.1f}s. Blend OOF={blend_auc:.5f}")

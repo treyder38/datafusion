@@ -88,6 +88,13 @@ STEPS = [
         depends_on=("fe",),
     ),
     Step(
+        key="lgbm_diverse",
+        label="LightGBM diverse variants",
+        script="03b_train_lgbm_diverse.py",
+        outputs=("checkpoints_lgbm_diverse/lgbm_diverse_predictions.npz",),
+        depends_on=("fe",),
+    ),
+    Step(
         key="xgboost",
         label="XGBoost",
         script="04_train_xgboost.py",
@@ -120,7 +127,7 @@ STEPS = [
         label="Blend",
         script="08_blend.py",
         outputs=("blend_artifacts/blend_data.npz", "submissions/blend.parquet"),
-        depends_on=("nn", "lgbm", "xgboost", "pyboost", "catboost", "lgbm_meta"),
+        depends_on=("nn", "lgbm", "lgbm_diverse", "xgboost", "pyboost", "catboost", "lgbm_meta"),
     ),
     Step(
         key="stacking",

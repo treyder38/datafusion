@@ -85,10 +85,10 @@ def stack_lgbm_meta(X_train, y_train, X_test, target_cols, device_params):
     test_preds = np.zeros((n_test, n_targets), dtype=np.float32)
 
     kf = MultilabelStratifiedKFold(n_splits=N_META_FOLDS, shuffle=True, random_state=SEED)
-    params = dict(objective="binary", metric="auc", num_leaves=8, max_depth=3,
-                  learning_rate=0.05, n_estimators=200, subsample=0.8,
+    params = dict(objective="binary", metric="auc", num_leaves=16, max_depth=4,
+                  learning_rate=0.05, n_estimators=500, subsample=0.8,
                   colsample_bytree=0.8, reg_alpha=1.0, reg_lambda=1.0,
-                  min_child_samples=1000, random_state=SEED, verbose=-1, n_jobs=-1)
+                  min_child_samples=300, random_state=SEED, verbose=-1, n_jobs=-1)
 
     t0 = time.time()
     for t_idx in range(n_targets):
@@ -97,7 +97,7 @@ def stack_lgbm_meta(X_train, y_train, X_test, target_cols, device_params):
             model = lgb.LGBMClassifier(**params, **device_params)
             model.fit(X_train[tr_idx], y_t[tr_idx],
                       eval_set=[(X_train[val_idx], y_t[val_idx])],
-                      callbacks=[lgb.early_stopping(30, verbose=False)])
+                      callbacks=[lgb.early_stopping(50, verbose=False)])
             oof_preds[val_idx, t_idx] = model.predict_proba(X_train[val_idx])[:, 1]
             test_preds[:, t_idx] += model.predict_proba(X_test)[:, 1] / N_META_FOLDS
 
@@ -190,6 +190,16 @@ def main():
     model_names.append("CatBoost"); oof_arrays.append(oof_cb); test_arrays.append(test_cb)
     oof_lgbm_meta = d["oof_lgbm_meta"].astype(np.float32); test_lgbm_meta = d["test_lgbm_meta"].astype(np.float32)
     model_names.append("LGBM_meta"); oof_arrays.append(oof_lgbm_meta); test_arrays.append(test_lgbm_meta)
+
+    # Diverse LGBM variants (optional)
+    for vkey in ["focal", "high_spw", "low_reg"]:
+        oof_key, test_key = f"oof_lgbm_{vkey}", f"test_lgbm_{vkey}"
+        if oof_key in d:
+            oof_v = d[oof_key].astype(np.float32)
+            test_v = d[test_key].astype(np.float32)
+            model_names.append(f"LGBM_{vkey}")
+            oof_arrays.append(oof_v)
+            test_arrays.append(test_v)
 
     n_models = len(model_names)
     n_test = test_nn.shape[0]
