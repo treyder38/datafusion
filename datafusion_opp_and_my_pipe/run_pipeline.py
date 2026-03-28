@@ -64,7 +64,7 @@ STEPS = [
         label="kNN features",
         script="01d_knn_features.py",
         outputs=("features/knn_features_train.parquet", "features/knn_features_test.parquet"),
-        depends_on=("fe",),
+        depends_on=("nn",),
     ),
     Step(
         key="nn",

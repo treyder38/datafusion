@@ -5,8 +5,12 @@ For each target, computes neighbor-based features using OOF methodology:
   - knn_weighted_mean: distance-weighted mean (closer neighbors count more)
   - knn_topk_mean:     mean of top-k/2 closest neighbors only
 
-This is a simple, stable alternative to TabR that captures local structure
-in the feature space. Expected gain: +0.005-0.01 macro AUC.
+Uses DAE embeddings (256-dim learned representation from NN step) as the
+feature space with cosine distance. DAE captures non-linear patterns that
+raw Euclidean distance in high-dimensional feature space cannot.
+
+Fallback: if DAE embeddings are not available, uses raw numeric features
+with cosine distance and top-100 variance selection.
 
 Anti-leakage: kNN is fit on train fold only, queried on val fold (OOF style).
 
@@ -14,7 +18,7 @@ Output:
 - features/knn_features_train.parquet (750K × 123 columns: 41 targets × 3 features)
 - features/knn_features_test.parquet  (test × 123 columns)
 
-Runtime: ~15-30 min on CPU (parallelized across targets).
+Runtime: ~15-30 min on CPU.
 """
 
 import json
@@ -26,13 +30,14 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import normalize
 from sklearn.metrics import roc_auc_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
 from utils import SEED, DATA_DIR, N_FOLDS
 
 FEATURES_DIR = Path("features")
+NN_CHECKPOINT_DIR = Path("checkpoints_nn")
 K = 8  # number of neighbors (not 16 — too many smooths out signal)
 K_TOP = 4  # for knn_topk_mean: use only closest K_TOP neighbors
 
@@ -79,33 +84,40 @@ def main():
     feature_cols = meta["feature_names"]
     n_targets = len(target_cols)
 
-    # Load features
+    # Load data
     print("\n[1/4] Loading data...")
-    train_feat = pl.read_parquet(FEATURES_DIR / "train_features.parquet")
-    test_feat = pl.read_parquet(FEATURES_DIR / "test_features.parquet")
     train_tgt = pl.read_parquet(FEATURES_DIR / "targets.parquet")
-
-    # Use only numeric features for kNN (categorical distances are meaningless)
-    num_cols = [c for c in feature_cols if not c.startswith("cat_feature_")]
-    print(f"  Using {len(num_cols)} numeric features for kNN distance")
-
-    X_train = np.nan_to_num(train_feat.select(num_cols).to_numpy().astype(np.float32), nan=0.0)
-    X_test = np.nan_to_num(test_feat.select(num_cols).to_numpy().astype(np.float32), nan=0.0)
     y_train = train_tgt.select(target_cols).to_numpy().astype(np.float32)
+
+    # Try DAE embeddings first (256-dim learned representation from NN step)
+    dae_train_path = NN_CHECKPOINT_DIR / "dae_train_emb.npy"
+    dae_test_path = NN_CHECKPOINT_DIR / "dae_test_emb.npy"
+    use_dae = dae_train_path.exists() and dae_test_path.exists()
+
+    if use_dae:
+        print("  Using DAE embeddings (256-dim learned space) + cosine distance")
+        X_train = np.load(str(dae_train_path)).astype(np.float32)
+        X_test = np.load(str(dae_test_path)).astype(np.float32)
+    else:
+        print("  DAE embeddings not found, falling back to raw numeric features")
+        train_feat = pl.read_parquet(FEATURES_DIR / "train_features.parquet")
+        test_feat = pl.read_parquet(FEATURES_DIR / "test_features.parquet")
+        num_cols = [c for c in feature_cols if not c.startswith("cat_feature_")]
+        print(f"  Using {len(num_cols)} numeric features for kNN distance")
+        X_train = np.nan_to_num(train_feat.select(num_cols).to_numpy().astype(np.float32), nan=0.0)
+        X_test = np.nan_to_num(test_feat.select(num_cols).to_numpy().astype(np.float32), nan=0.0)
+        # Reduce dimensionality for raw features
+        MAX_FEATURES = 100
+        if len(num_cols) > MAX_FEATURES:
+            variances = np.var(X_train, axis=0)
+            top_var_idx = np.argsort(variances)[::-1][:MAX_FEATURES]
+            X_train = X_train[:, top_var_idx]
+            X_test = X_test[:, top_var_idx]
+            print(f"  Reduced to top {MAX_FEATURES} features by variance")
 
     n_train = X_train.shape[0]
     n_test = X_test.shape[0]
     print(f"  X_train: {X_train.shape}, X_test: {X_test.shape}")
-
-    # Per-target feature selection: use top features by variance
-    # (reduces curse of dimensionality for kNN)
-    MAX_FEATURES = 100
-    if len(num_cols) > MAX_FEATURES:
-        variances = np.var(X_train, axis=0)
-        top_var_idx = np.argsort(variances)[::-1][:MAX_FEATURES]
-        X_train = X_train[:, top_var_idx]
-        X_test = X_test[:, top_var_idx]
-        print(f"  Reduced to top {MAX_FEATURES} features by variance")
 
     # OOF kNN feature generation
     print(f"\n[2/4] Computing OOF kNN features ({N_FOLDS}-fold)...")
@@ -119,20 +131,21 @@ def main():
     for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(np.arange(n_train), y_train)):
         t_fold = time.time()
 
-        # Standardize using train fold statistics
-        scaler = StandardScaler()
-        X_tr_scaled = scaler.fit_transform(X_train[tr_idx])
-        X_val_scaled = scaler.transform(X_train[val_idx])
-        X_test_scaled = scaler.transform(X_test)
+        # L2-normalize for cosine distance (cosine = 1 - dot(a/|a|, b/|b|))
+        # sklearn NearestNeighbors with metric='cosine' handles this, but
+        # pre-normalizing + brute force is faster for dense data
+        X_tr_norm = normalize(X_train[tr_idx], norm='l2')
+        X_val_norm = normalize(X_train[val_idx], norm='l2')
+        X_test_norm = normalize(X_test, norm='l2')
 
-        # Fit kNN on train fold
-        nn = NearestNeighbors(n_neighbors=K, metric='euclidean', n_jobs=-1, algorithm='auto')
-        nn.fit(X_tr_scaled)
+        # Fit kNN on train fold with cosine distance
+        nn = NearestNeighbors(n_neighbors=K, metric='cosine', n_jobs=-1, algorithm='brute')
+        nn.fit(X_tr_norm)
 
         # Query val fold
-        val_distances, val_indices = nn.kneighbors(X_val_scaled)
+        val_distances, val_indices = nn.kneighbors(X_val_norm)
         # Query test
-        test_distances, test_indices = nn.kneighbors(X_test_scaled)
+        test_distances, test_indices = nn.kneighbors(X_test_norm)
 
         # Compute features for each target
         for t_idx in range(n_targets):
