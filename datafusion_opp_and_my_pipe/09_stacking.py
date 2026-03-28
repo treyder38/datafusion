@@ -1,4 +1,4 @@
-"""Step 9: Stacking — LGBM meta-learner + combo (7 models including TabR).
+"""Step 9: Stacking — LGBM meta-learner + combo.
 
 Meta-features: 7x41 base + C(7,2)x41 pairwise |diffs| + C(7,2)x41 pairwise prods + aggregates.
 LGBM meta-learner trained with 4-fold OOF.
@@ -165,7 +165,7 @@ def main():
     y = train_tgt.select(target_cols).to_numpy().astype(np.float32)
     n_train, n_targets = y.shape
 
-    # Load predictions — dynamic model list (TabR optional)
+    # Load predictions — dynamic model list
     print("\n[1/4] Loading predictions...")
     d = np.load("blend_artifacts/blend_data.npz")
     model_names = []
@@ -174,11 +174,6 @@ def main():
     oof_nn = d["oof_nn"].astype(np.float32)
     test_nn = d["test_nn"].astype(np.float32)
     model_names.append("NN"); oof_arrays.append(oof_nn); test_arrays.append(test_nn)
-
-    if "oof_tabr" in d:
-        oof_tabr = d["oof_tabr"].astype(np.float32)
-        test_tabr = d["test_tabr"].astype(np.float32)
-        model_names.append("TabR"); oof_arrays.append(oof_tabr); test_arrays.append(test_tabr)
 
     oof_lgbm = d["oof_lgbm"].astype(np.float32); test_lgbm = d["test_lgbm"].astype(np.float32)
     model_names.append("LGBM"); oof_arrays.append(oof_lgbm); test_arrays.append(test_lgbm)

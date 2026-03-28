@@ -74,13 +74,6 @@ STEPS = [
         depends_on=("nn",),
     ),
     Step(
-        key="tabr",
-        label="TabR (retrieval-based NN)",
-        script="02b_train_tabr.py",
-        outputs=("checkpoints_tabr/tabr_predictions.npz",),
-        depends_on=("fe",),
-    ),
-    Step(
         key="lgbm",
         label="LightGBM",
         script="03_train_lgbm.py",

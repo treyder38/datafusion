@@ -1,6 +1,6 @@
-"""Step 8: Rank per-target blend (NN + TabR + LGBM + XGBoost + PyBoost + CatBoost + LGBM meta).
+"""Step 8: Rank per-target blend (NN + LGBM + XGBoost + PyBoost + CatBoost + LGBM meta + diverse LGBM).
 
-Per-target weight optimization on OOF via grid search (7 models, TabR optional).
+Per-target weight optimization on OOF via grid search.
 
 Output: submissions/blend.parquet
 
@@ -151,7 +151,7 @@ def main():
     target_cols = [c for c in train_tgt.columns if c.startswith("target_")]
     y = train_tgt.select(target_cols).to_numpy().astype(np.float32)
 
-    # Load predictions — build model list dynamically (TabR is optional)
+    # Load predictions — build model list dynamically
     print("\n[1/3] Loading predictions...")
     model_names = []
     oof_list, test_list = [], []
@@ -161,16 +161,6 @@ def main():
     print(f"  NN: OOF {nn_auc:.5f}")
     model_names.append("NN"); oof_list.append(oof_nn); test_list.append(test_nn)
 
-    # TabR: include only if actually trained (no NN-duplicate fallback)
-    tabr_path = Path("checkpoints_tabr/tabr_predictions.npz")
-    if tabr_path.exists():
-        d = np.load(str(tabr_path))
-        oof_tabr, test_tabr = d["oof_preds"], d["test_preds"]
-        tabr_auc, _ = compute_macro_auc(y, oof_tabr, target_cols)
-        print(f"  TabR: OOF {tabr_auc:.5f}")
-        model_names.append("TabR"); oof_list.append(oof_tabr); test_list.append(test_tabr)
-    else:
-        print(f"  TabR: not found, skipping (6-model blend)")
 
     d = np.load("checkpoints_lgbm/lgbm_predictions.npz")
     oof_lgbm, test_lgbm = d["oof_preds"], d["test_preds"]
@@ -258,7 +248,6 @@ def main():
     submit.write_parquet("submissions/blend.parquet")
     print(f"  Saved: submissions/blend.parquet")
 
-    # Save artifacts for stacking (always include TabR keys for compatibility)
     Path("blend_artifacts").mkdir(exist_ok=True)
     save_dict = dict(
         oof_nn=oof_nn, test_nn=test_nn,
@@ -269,9 +258,6 @@ def main():
         oof_lgbm_meta=oof_lgbm_meta, test_lgbm_meta=test_lgbm_meta,
         weights=weights,
     )
-    if "TabR" in model_names:
-        save_dict["oof_tabr"] = oof_list[model_names.index("TabR")]
-        save_dict["test_tabr"] = test_list[model_names.index("TabR")]
     for vkey in ["focal", "high_spw", "low_reg"]:
         name = f"LGBM_{vkey}"
         if name in model_names:

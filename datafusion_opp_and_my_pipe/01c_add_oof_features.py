@@ -1,6 +1,6 @@
 """Step 1c: Extract and save cross-target OOF features.
 
-Loads OOF predictions from all base models (NN, LGBM, XGBoost, PyBoost, CatBoost, TabR if available).
+Loads OOF predictions from all base models (NN, LGBM, XGBoost, PyBoost, CatBoost).
 Computes consensus OOF (mean across available models) to reduce noise.
 Saves as parquet for reuse in base model retraining with cross-talk signal.
 
@@ -107,15 +107,6 @@ def main():
     except Exception as e:
         print(f"  CatBoost: not found")
 
-    # TabR (optional)
-    try:
-        d = np.load("checkpoints_tabr/tabr_predictions.npz")
-        oof_list.append(d["oof_preds"].astype(np.float32))
-        test_list.append(d["test_preds"].astype(np.float32))
-        model_names.append("TabR")
-        print(f"  TabR: {d['oof_preds'].shape}")
-    except Exception as e:
-        print(f"  TabR: not found (optional)")
 
     if not oof_list:
         print("\nERROR: No OOF predictions found. Run base models first.")
