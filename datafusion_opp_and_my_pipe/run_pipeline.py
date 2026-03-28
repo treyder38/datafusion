@@ -60,18 +60,18 @@ STEPS = [
         depends_on=("nn", "lgbm", "xgboost", "pyboost", "catboost"),
     ),
     Step(
-        key="knn_feats",
-        label="kNN features",
-        script="01d_knn_features.py",
-        outputs=("features/knn_features_train.parquet", "features/knn_features_test.parquet"),
-        depends_on=("nn",),
-    ),
-    Step(
         key="nn",
         label="Neural network",
         script="02_train_nn.py",
         outputs=tuple(f"checkpoints_nn/fold_{i}.npz" for i in range(N_FOLDS)),
         depends_on=("fe",),
+    ),
+    Step(
+        key="knn_feats",
+        label="kNN features",
+        script="01d_knn_features.py",
+        outputs=("features/knn_features_train.parquet", "features/knn_features_test.parquet"),
+        depends_on=("nn",),
     ),
     Step(
         key="tabr",
