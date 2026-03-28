@@ -76,7 +76,7 @@ def main():
     with open(FEATURES_DIR / "meta.json") as f:
         meta = json.load(f)
     target_cols = meta["target_cols"]
-    feature_cols = meta["feature_cols"]
+    feature_cols = meta["feature_names"]
     n_targets = len(target_cols)
 
     # Load features
@@ -89,8 +89,8 @@ def main():
     num_cols = [c for c in feature_cols if not c.startswith("cat_feature_")]
     print(f"  Using {len(num_cols)} numeric features for kNN distance")
 
-    X_train = train_feat.select(num_cols).to_numpy().astype(np.float32)
-    X_test = test_feat.select(num_cols).to_numpy().astype(np.float32)
+    X_train = np.nan_to_num(train_feat.select(num_cols).to_numpy().astype(np.float32), nan=0.0)
+    X_test = np.nan_to_num(test_feat.select(num_cols).to_numpy().astype(np.float32), nan=0.0)
     y_train = train_tgt.select(target_cols).to_numpy().astype(np.float32)
 
     n_train = X_train.shape[0]
